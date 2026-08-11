@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: lidar-frontend
+    env: production
+    rootDir: .
+    dockerfile: Dockerfile
+    buildOn:
+      - main
+    autoDeploy: true
+    ports:
+      - "80:80"
+    healthCheckPath: /health
+    dependencies:
+      - lidar-backend
+
+  - type: web
+    name: lidar-backend
+    env: production
+    rootDir: backend
+    dockerfile: Dockerfile
+    buildOn:
+      - main
+    autoDeploy: true
+    ports:
+      - "3001:3001"
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "3001"
+    disk:
+      sizeGB: 10
+      mountPath: /app/output

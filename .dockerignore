@@ -1,0 +1,12 @@
+node_modules
+dist
+.git
+.gitignore
+backend/venv
+backend/__pycache__
+本地数据
+*.las
+*.laz
+*.bin
+*.ply
+*.pcd
