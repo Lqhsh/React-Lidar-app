@@ -6,7 +6,7 @@ import path from 'path'
 
 // 创建 Express 应用实例
 const app = express()
-const PORT = 3001
+const PORT = parseInt(process.env.PORT || '3001', 10)
 
 // ES Module 中获取 __dirname 的兼容写法
 const __dirname = decodeURIComponent(path.dirname(new URL(import.meta.url).pathname)).replace(/^\/([A-Za-z]:)/, '$1')
@@ -1283,8 +1283,8 @@ function startServer() {
   // 并行启动：不等检查完成
   checkPythonEnvironment()
 
-  app.listen(PORT, () => {
-    console.log(`🚀 服务已启动: http://localhost:${PORT}`)
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 服务已启动: http://0.0.0.0:${PORT}`)
     console.log(`📡 LAS头信息: POST /api/las-header`)
     console.log(`🔍 LAS字段解析: POST /api/las-parse`)
     console.log(`📤 BIN格式解析: POST /api/bin-parse`)

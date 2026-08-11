@@ -1,22 +1,35 @@
-name: Deploy to Render
+# CI 构建检查 - 验证代码可编译
+# CD 持续部署由 Render Blueprint 自动完成（render.yaml 中 autoDeploy: true）
+# 部署步骤：在 Render Dashboard → New → Blueprint → 选择仓库
+name: CI Build Check
 
 on:
   push:
     branches: [main]
-  workflow_dispatch:
+  pull_request:
+    branches: [main]
 
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Deploy to Render
-        uses: renderinc/render-action@v1
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
         with:
-          api-key: ${{ secrets.RENDER_API_KEY }}
-          service-id: ${{ secrets.RENDER_SERVICE_ID }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          root-dir: .
-          dockerfile-path: Dockerfile
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend (tsc + vite build)
+        run: npm run build
+
+      - name: Check backend TypeScript
+        working-directory: backend
+        run: |
+          npm ci
+          npx tsc --noEmit

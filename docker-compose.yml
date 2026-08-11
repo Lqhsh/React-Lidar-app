@@ -1,14 +1,20 @@
 version: '3.8'
 
+# 本地 Docker Compose 测试配置
+# 使用：docker-compose up --build
+# 访问：http://localhost:8080
 services:
   frontend:
     build:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "80:80"
+      - "8080:80"  # 本地 8080 → 容器 80
     depends_on:
       - backend
+    environment:
+      # 通过 Docker 网络服务名访问后端
+      - BACKEND_URL=http://backend:3001
     networks:
       - lidar-network
 
