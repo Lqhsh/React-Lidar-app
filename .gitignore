@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+backend/node_modules/
+
+# Build output
+dist/
+backend/dist/
+
+# Python
+backend/venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Temp files
+backend/output/
+backend/tmp/
+*.tmp
+
+# Data files (large binary files)
+*.las
+*.laz
+*.bin
+*.ply
+*.pcd
+本地数据/

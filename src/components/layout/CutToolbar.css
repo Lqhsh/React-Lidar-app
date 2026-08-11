@@ -1,0 +1,203 @@
+.cut-toolbar {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(255, 255, 255, 0.95);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid #E2E8F0;
+  border-radius: 12px;
+  padding: 10px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-shadow: 0 4px 20px rgba(15, 23, 42, 0.08);
+  z-index: 50;
+  min-width: 200px;
+}
+
+.cut-toolbar-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #64748B;
+  padding-right: 16px;
+  border-right: 1px solid #E2E8F0;
+  white-space: nowrap;
+}
+
+.cut-toolbar-buttons {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.cut-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  background: #F8FAFC;
+  border: 1px solid #E2E8F0;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  white-space: nowrap;
+}
+
+.cut-btn:hover {
+  background: #EFF6FF;
+  border-color: var(--cut-color);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.08);
+}
+
+.cut-btn:hover .cut-btn-label {
+  color: var(--cut-color);
+}
+
+.cut-btn-active {
+  background: var(--cut-color) !important;
+  border-color: var(--cut-color) !important;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+
+.cut-btn-active .cut-btn-label {
+  color: white !important;
+}
+
+.cut-btn:active .cut-btn-icon {
+  transform: scale(0.95);
+}
+
+.cut-btn-icon {
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.2s ease;
+}
+
+.cut-btn:hover .cut-btn-icon {
+  transform: scale(1.1);
+}
+
+.cut-btn-label {
+  font-size: 13px;
+  color: #334155;
+  font-weight: 500;
+  transition: color 0.2s ease;
+}
+
+.cut-toolbar-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-left: auto;
+}
+
+.cut-action-divider {
+  width: 1px;
+  height: 24px;
+  background: #E2E8F0;
+  margin: 0 4px;
+}
+
+.cut-action-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  border: 1px solid transparent;
+}
+
+.cut-action-confirm {
+  background: #D1FAE5;
+  border-color: #10B981;
+}
+
+.cut-action-confirm:hover {
+  background: #A7F3D0;
+  box-shadow: 0 2px 8px rgba(16, 185, 129, 0.3);
+}
+
+.cut-action-cancel {
+  background: #FEE2E2;
+  border-color: #EF4444;
+}
+
+.cut-action-cancel:hover {
+  background: #FECACA;
+  box-shadow: 0 2px 8px rgba(239, 68, 68, 0.3);
+}
+
+.cut-toolbar-hint {
+  font-size: 11px;
+  color: #64748B;
+  padding: 6px 10px;
+  background: #FEF3C7;
+  border-radius: 6px;
+  border: 1px solid #FDE68A;
+  text-align: center;
+  animation: hint-pulse 2s ease-in-out infinite;
+}
+
+@keyframes hint-pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.7;
+  }
+}
+
+/* 裁剪模式下的鼠标指针样式 */
+.crop-cursor-rectangle {
+  cursor: crosshair;
+}
+
+.crop-cursor-polygon {
+  cursor: crosshair;
+}
+
+.crop-cursor-sphere {
+  cursor: radial-gradient(circle, #F59E0B 0%, #F59E0B 50%, transparent 50%);
+}
+
+.crop-cursor-cylinder {
+  cursor: crosshair;
+}
+
+/* 裁剪区域预览样式 */
+.crop-preview-overlay {
+  position: absolute;
+  pointer-events: none;
+  z-index: 60;
+}
+
+.crop-preview-rectangle {
+  border: 2px dashed #F59E0B;
+  background: rgba(245, 158, 11, 0.1);
+}
+
+.crop-preview-polygon {
+  fill: rgba(99, 102, 241, 0.1);
+  stroke: #6366F1;
+  stroke-width: 2;
+  stroke-dasharray: 8, 4;
+}
+
+.crop-preview-sphere {
+  border: 2px dashed #EC4899;
+  border-radius: 50%;
+  background: rgba(236, 72, 153, 0.1);
+}
+
+.crop-preview-cylinder {
+  border: 2px dashed #06B6D4;
+  background: rgba(6, 182, 212, 0.1);
+}

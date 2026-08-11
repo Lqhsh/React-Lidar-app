@@ -1,0 +1,105 @@
+.app-container {
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  background-color: #FFFFFF;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-content {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  padding-top: 56px;
+}
+
+.toolbar-wrapper {
+  width: 88px;
+  flex-shrink: 0;
+  padding: 16px 0;
+  display: flex;
+  flex-direction: column;
+  transition: width 0.3s ease, opacity 0.3s ease;
+  position: relative;
+  z-index: 100;
+  background-color: #F8FAFC;
+  border-right: 1px solid #E2E8F0;
+}
+
+.toolbar-wrapper.collapsed {
+  width: 0;
+  padding: 0;
+  opacity: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.viewport-wrapper {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+  background-color: #FFFFFF;
+  z-index: 10;
+}
+
+.sidebar-wrapper {
+  width: 336px;
+  flex-shrink: 0;
+  padding: 16px 0;
+  transition: width 0.3s ease, opacity 0.3s ease;
+  background-color: #F8FAFC;
+  border-left: 1px solid #E2E8F0;
+}
+
+.sidebar-wrapper.collapsed {
+  width: 0;
+  padding: 0;
+  opacity: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.toggle-btn {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 36px;
+  height: 36px;
+  border: 1px solid #E2E8F0;
+  background: #FFFFFF;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  z-index: 40;
+  transition: all 0.2s ease;
+  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.06);
+}
+
+.toggle-btn:hover {
+  background: #F8FAFC;
+  border-color: #CBD5E1;
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08);
+}
+
+.toggle-btn-icon {
+  width: 16px;
+  height: 16px;
+  color: #64748B;
+}
+
+.toggle-btn:hover .toggle-btn-icon {
+  color: #1E293B;
+}
+
+.toggle-btn-left {
+  left: 4px;
+}
+
+.toggle-btn-right {
+  right: 4px;
+}

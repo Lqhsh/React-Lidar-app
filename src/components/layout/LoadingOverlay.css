@@ -1,0 +1,236 @@
+/* 加载遮罩层 - 白色明亮主题 */
+.loader-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background-color: #FFFFFF;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 1;
+  transition: opacity 0.55s ease-out;
+  overflow: hidden;
+}
+
+/* 淡出状态 */
+.loader-overlay.loader-fade-out {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Canvas 画布 */
+.loader-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* 文字内容容器 */
+.loader-content {
+  position: relative;
+  z-index: 2;
+  text-align: center;
+  user-select: none;
+  pointer-events: none;
+  animation: loader-content-in 0.6s cubic-bezier(0.34, 1.56, 0.64, 1) 0.25s both;
+}
+
+@keyframes loader-content-in {
+  from {
+    opacity: 0;
+    transform: translateY(20px) scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* 主标题 - 深色文字适配白色背景 */
+.loader-title {
+  font-size: 32px;
+  font-weight: 600;
+  letter-spacing: 6px;
+  color: #1E293B;
+  text-shadow: 0 2px 20px rgba(99, 102, 241, 0.15);
+  margin-bottom: 8px;
+}
+
+/* 副标题 */
+.loader-subtitle {
+  font-size: 13px;
+  font-weight: 400;
+  letter-spacing: 3px;
+  color: #94A3B8;
+  margin-bottom: 24px;
+}
+
+/* 进度条 */
+.loader-bar {
+  width: 220px;
+  height: 2px;
+  background: #E2E8F0;
+  border-radius: 1px;
+  overflow: hidden;
+  margin: 0 auto;
+}
+
+/* 进度条填充 */
+.loader-bar-fill {
+  height: 100%;
+  width: 0;
+  background: linear-gradient(90deg, #6366F1, #818CF8);
+  border-radius: 1px;
+  box-shadow: 0 0 8px rgba(99, 102, 241, 0.4);
+  animation: loader-bar-progress linear forwards;
+}
+
+@keyframes loader-bar-progress {
+  from {
+    width: 0;
+  }
+  to {
+    width: 100%;
+  }
+}
+
+/* ====================================================
+   主界面元素浮现动画 - 使用 @keyframes 确保动画可靠触发
+   ==================================================== */
+
+/* 禁用可能与 animation 冲突的 transition */
+.app-container .navbar,
+.app-container .toolbar-wrapper,
+.app-container .viewport-wrapper,
+.app-container .sidebar-wrapper,
+.app-container .bottom-controls-wrapper {
+  transition: none !important;
+}
+
+/* loading 状态：元素隐藏（不播放动画） */
+.app-loading .navbar,
+.app-loading .toolbar-wrapper,
+.app-loading .viewport-wrapper,
+.app-loading .sidebar-wrapper,
+.app-loading .bottom-controls-wrapper {
+  opacity: 0;
+}
+
+.app-loading .navbar,
+.app-loading .toolbar-wrapper,
+.app-loading .sidebar-wrapper {
+  transform: translateY(120%);
+}
+
+.app-loading .viewport-wrapper {
+  transform: translateY(60px);
+}
+
+.app-loading .bottom-controls-wrapper {
+  transform: translate(-50%, 150%);
+}
+
+/* ready 状态：触发 @keyframes 动画（依次延迟浮现） */
+.app-ready .navbar {
+  animation: bounceInBottom 0.7s cubic-bezier(0.34, 1.56, 0.64, 1) 0ms forwards;
+}
+
+.app-ready .toolbar-wrapper {
+  animation: bounceInBottom 0.7s cubic-bezier(0.34, 1.56, 0.64, 1) 100ms forwards;
+}
+
+.app-ready .viewport-wrapper {
+  animation: bounceInBottomSmall 0.7s cubic-bezier(0.34, 1.56, 0.64, 1) 200ms forwards;
+}
+
+.app-ready .sidebar-wrapper {
+  animation: bounceInBottom 0.7s cubic-bezier(0.34, 1.56, 0.64, 1) 300ms forwards;
+}
+
+.app-ready .bottom-controls-wrapper {
+  animation: bounceInBottomCenter 0.7s cubic-bezier(0.34, 1.56, 0.64, 1) 400ms forwards;
+}
+
+/* done 状态：确保元素保持在最终位置，并重新启用 transition */
+.app-done .navbar,
+.app-done .toolbar-wrapper,
+.app-done .sidebar-wrapper {
+  transform: translateY(0);
+  opacity: 1;
+}
+
+.app-done .viewport-wrapper {
+  transform: translateY(0);
+  opacity: 1;
+}
+
+.app-done .bottom-controls-wrapper {
+  transform: translate(-50%, 0);
+  opacity: 1;
+}
+
+/* done 状态重新启用 transition（用于后续的交互） */
+.app-done .toolbar-wrapper {
+  transition: width 0.3s ease, opacity 0.3s ease;
+}
+
+.app-done .sidebar-wrapper {
+  transition: width 0.3s ease, opacity 0.3s ease;
+}
+
+/* ====================================================
+   @keyframes 定义
+   ==================================================== */
+
+/* 从底部弹跳上来（适用于 navbar, toolbar, sidebar） */
+@keyframes bounceInBottom {
+  0% {
+    opacity: 0;
+    transform: translateY(120%);
+  }
+  60% {
+    opacity: 1;
+    transform: translateY(-10%);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* 从底部弹跳上来（带水平居中，适用于底部控制栏） */
+@keyframes bounceInBottomCenter {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, 150%);
+  }
+  60% {
+    opacity: 1;
+    transform: translate(-50%, -10%);
+  }
+  100% {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+/* 较小位移版本（适用于 viewport，因为它在页面中央） */
+@keyframes bounceInBottomSmall {
+  0% {
+    opacity: 0;
+    transform: translateY(60px);
+  }
+  60% {
+    opacity: 1;
+    transform: translateY(-5px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
