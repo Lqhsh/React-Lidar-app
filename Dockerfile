@@ -21,8 +21,8 @@ COPY --from=build /app/dist /usr/share/nginx/html
 # 复制 Nginx 配置（放在普通路径，不走默认 template 机制）
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 
-# 默认后端地址（本地构建时使用，Zeabur 部署会覆盖为后端公网 URL）
-ENV BACKEND_URL=http://localhost:3001
+# 默认后端地址（Zeabur 部署时会被环境变量覆盖）
+ENV BACKEND_URL=https://lidar-backend.zeabur.app
 
 EXPOSE 8080
 

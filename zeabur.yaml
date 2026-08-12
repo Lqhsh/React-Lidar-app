@@ -31,6 +31,4 @@ services:
     # 关键：将后端服务的公网 URL 注入前端 Nginx 配置
     env:
       NODE_ENV: production
-      # 在 Zeabur Dashboard 中需手动设置此变量，指向后端服务的公网 URL
-      # 格式：https://lidar-backend-xxxx.zeabur.app
-      BACKEND_URL: ""
+      BACKEND_URL: "https://lidar-backend.zeabur.app"
