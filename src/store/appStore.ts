@@ -161,7 +161,7 @@ interface AppState {
   applyFilter: (method: 'statistical' | 'gaussian' | 'csf', params: FilterParams) => void
   resetFilter: () => void
   normalizeHeight: (resolution?: number) => Promise<void>
-  classifyGroundObjects: (resolution?: number, eps?: number, minSamples?: number) => Promise<any[]>
+  classifyGroundObjects: (resolution?: number, eps?: number, minSamples?: number, classifyMode?: 'intensity' | 'geometric' | 'hybrid') => Promise<any[]>
   classifyDeepLearning: (voxelSize?: number, device?: string) => Promise<any[]>
   segmentTrees: (params: Record<string, number>) => Promise<any[]>
   segmentBuildings: (params: Record<string, number>) => Promise<any[]>
@@ -1250,14 +1250,20 @@ export const useAppStore = create<AppState>((set) => ({
         throw new Error('点数量不足以执行高度归一化（需要至少10个点）')
       }
 
-      // 发送到后端
+      const origMinZ = layer.stats?.minZ ?? Infinity
+      const origMaxZ = layer.stats?.maxZ ?? -Infinity
+      console.log(`[高度归一化] 原始Z范围: [${origMinZ.toFixed(3)}, ${origMaxZ.toFixed(3)}]`)
+      console.log(`[高度归一化] 原始点数: ${pointCount}`)
+
+      // 使用显式的二进制视图发送数据，确保数据完整
+      const requestBody = new Uint8Array(points.buffer, points.byteOffset, points.byteLength)
       const response = await fetch('/api/height-normalize', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/octet-stream',
           'x-resolution': resolution.toString(),
         },
-        body: points.slice().buffer,
+        body: requestBody,
       })
 
       if (!response.ok) {
@@ -1270,27 +1276,37 @@ export const useAppStore = create<AppState>((set) => ({
         throw new Error(errMsg)
       }
 
-      // 解析响应元数据（供调试，不影响主流程）
+      // 解析响应元数据（供调试）
       const metaHeader = response.headers.get('X-Meta-Info')
       if (metaHeader) {
         try {
           const metaInfo = JSON.parse(decodeURIComponent(metaHeader))
-          console.log('[高度归一化] 元数据:', metaInfo)
+          console.log('[高度归一化] 后端元数据:', metaInfo)
         } catch { /* ignore */ }
       }
 
       const buffer = await response.arrayBuffer()
+      console.log(`[高度归一化] 响应字节数: ${buffer.byteLength}`)
+      
       if (buffer.byteLength < 12) {
         throw new Error('归一化结果数据为空')
       }
 
       const normalizedPoints = new Float32Array(buffer)
       const newPointCount = normalizedPoints.length / 3
+      console.log(`[高度归一化] 归一化后点数: ${newPointCount}`)
 
-      // 计算统计信息
+      // 计算并验证归一化后的统计信息
+      let newMinZ = Infinity, newMaxZ = -Infinity
+      for (let i = 2; i < normalizedPoints.length; i += 3) {
+        const z = normalizedPoints[i]
+        if (z < newMinZ) newMinZ = z
+        if (z > newMaxZ) newMaxZ = z
+      }
+      console.log(`[高度归一化] 归一化后Z范围: [${newMinZ.toFixed(3)}, ${newMaxZ.toFixed(3)}]`)
+
       const { stats: newStats, boundingBox: newBoundingBox } = calculateStats(normalizedPoints, layer.intensities ?? undefined)
 
-      // 创建新图层（保留原图层 + 新增归一化图层）
       const newLayerId = `layer-normalized-${Date.now()}`
       const normalizedLayer: Layer = {
         id: newLayerId,
@@ -1311,27 +1327,43 @@ export const useAppStore = create<AppState>((set) => ({
           normalized: true,
           originalLayerId: layer.id,
           normalizationResolution: resolution,
-          originalZRange: layer.stats ? {
-            min: layer.stats.minZ ?? 0,
-            max: layer.stats.maxZ ?? 0,
-          } : undefined,
+          originalZRange: {
+            min: origMinZ,
+            max: origMaxZ,
+          },
         },
       }
 
-      set({
-        layers: [...state.layers, normalizedLayer],
-        selectedLayerId: newLayerId,
-        points: normalizedPoints,
-        colors: layer.colors,
-        intensities: layer.intensities,
-        pointCount: newPointCount,
-        boundingBox: newBoundingBox,
-        stats: newStats,
-        isNormalizing: false,
-        fitToViewTrigger: state.fitToViewTrigger + 1,
+      // 降低原图层透明度，让归一化结果更明显
+      set((state) => {
+        const updatedLayers = state.layers.map(l => {
+          if (l.id === layer.id) {
+            return {
+              ...l,
+              opacity: 0.2,
+              visible: true,
+            }
+          }
+          return l
+        })
+
+        return {
+          layers: [...updatedLayers, normalizedLayer],
+          selectedLayerId: newLayerId,
+          points: normalizedPoints,
+          colors: layer.colors,
+          intensities: layer.intensities,
+          pointCount: newPointCount,
+          boundingBox: newBoundingBox,
+          stats: newStats,
+          isNormalizing: false,
+          fitToViewTrigger: state.fitToViewTrigger + 1,
+          message: `高度归一化完成：Z范围 [${newMinZ.toFixed(2)}, ${newMaxZ.toFixed(2)}]，共 ${newPointCount.toLocaleString()} 点`,
+        }
       })
 
       console.log(`[高度归一化] 完成: ${newPointCount} 点, 网格分辨率 ${resolution}m`)
+      console.log(`[高度归一化] 归一化后 Z 范围: [${newMinZ.toFixed(3)}, ${newMaxZ.toFixed(3)}]`)
     } catch (error: any) {
       console.error('高度归一化失败:', error)
       set({ isNormalizing: false })
@@ -1339,7 +1371,7 @@ export const useAppStore = create<AppState>((set) => ({
     }
   },
   
-  classifyGroundObjects: async (resolution = 1.0, eps = 1.5, minSamples = 10) => {
+  classifyGroundObjects: async (resolution = 1.0, eps = 1.5, minSamples = 10, classifyMode: 'intensity' | 'geometric' | 'hybrid' = 'intensity') => {
     const state = useAppStore.getState()
     
     if (!state.selectedLayerId) {
@@ -1358,6 +1390,21 @@ export const useAppStore = create<AppState>((set) => ({
     try {
       const points = layer.points
 
+      // 构建请求体: XYZ + Intensity (如果有)
+      let body: ArrayBuffer
+      let hasIntensity = false
+      if (layer.intensities && layer.intensities.length === points.length / 3) {
+        // 合并 XYZ + Intensity 为一个二进制 payload
+        const pointCount = points.length / 3
+        const combined = new Float32Array(pointCount * 4)
+        combined.set(points, 0)
+        combined.set(layer.intensities, pointCount * 3)
+        body = combined.buffer
+        hasIntensity = true
+      } else {
+        body = points.slice().buffer
+      }
+
       const response = await fetch('/api/classify', {
         method: 'POST',
         headers: {
@@ -1365,8 +1412,10 @@ export const useAppStore = create<AppState>((set) => ({
           'X-Resolution': resolution.toString(),
           'X-Eps': eps.toString(),
           'X-Min-Samples': minSamples.toString(),
+          'X-Classify-Mode': classifyMode,
+          'X-Has-Intensity': hasIntensity ? 'true' : 'false',
         },
-        body: points.slice().buffer,
+        body,
       })
 
       if (!response.ok) {
@@ -1441,6 +1490,16 @@ export const useAppStore = create<AppState>((set) => ({
       const classifyResults: any[] = []
       let colorIndex = 0
 
+      // 类别颜色映射 - 用于生成逐点颜色
+      const categoryRGBColors: Record<string, [number, number, number]> = {
+        ground: [0.85, 0.55, 0.15],          // 橙色 - 地面
+        tree: [0.13, 0.78, 0.22],              // 绿色 - 树木
+        building: [0.93, 0.25, 0.25],          // 红色 - 建筑物
+        low_vegetation: [0.20, 0.83, 0.55],    // 青绿 - 低矮植被
+        high_reflectivity: [0.96, 0.75, 0.15], // 黄色 - 高反射物
+        other: [0.42, 0.47, 0.54],             // 灰色 - 其他
+      }
+
       for (const result of results) {
         // 解码 base64 点云数据
         const binaryString = atob(result.data)
@@ -1461,9 +1520,23 @@ export const useAppStore = create<AppState>((set) => ({
         const categoryLabel: string = result.categoryLabel || categoryLabels[categoryKey] || categoryKey
         const instId: number = result.instanceId ?? 1
         
-        // 使用实例调色板为每个实例分配不同颜色（循环使用）
+        // 为每个实例分配不同颜色（循环使用调色板）
         const instanceColor = instancePalette[colorIndex % instancePalette.length]
         colorIndex++
+
+        // 生成逐点颜色 - 基于类别颜色，加入微小变化以便实例内区分
+        const catRGB = categoryRGBColors[categoryKey] || categoryRGBColors['other']
+        const instColors = new Float32Array(count * 3)
+        const hueShift = (colorIndex % 5 - 2) * 0.04 // 微小色相偏移
+        
+        for (let i = 0; i < count; i++) {
+          const idx = i * 3
+          // 添加微小变化使点云更有立体感
+          const variation = 1.0 + (Math.sin(i * 0.1) * 0.03)
+          instColors[idx] = Math.min(1, Math.max(0, catRGB[0] * variation + hueShift))
+          instColors[idx + 1] = Math.min(1, Math.max(0, catRGB[1] * variation))
+          instColors[idx + 2] = Math.min(1, Math.max(0, catRGB[2] * variation))
+        }
         
         // 图层命名："名字+编号"，如：地面1、树木1、建筑2
         const instanceLabel = `${categoryLabel}${instId}`
@@ -1472,14 +1545,14 @@ export const useAppStore = create<AppState>((set) => ({
         
         const newLayer: Layer = {
           id: layerId,
-          name: instanceLabel,  // 名字+编号格式
+          name: instanceLabel,
           type: 'pointcloud',
           visible: true,
           opacity: 1,
           pointCount: count,
           color: instanceColor,
           points: instPoints,
-          colors: null,
+          colors: instColors,  // 逐点颜色 - 基于类别
           intensities: null,
           classifications: null,
           radialDistances: null,

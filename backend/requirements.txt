@@ -1,3 +1,13 @@
+# Web 框架
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+
+# 点云处理
 numpy>=1.24.0
 laspy>=2.3.0
 open3d>=0.18.0
+scipy>=1.11.0
+
+# 深度学习（可选，RandLA-Net 推理）
+# torch>=2.0.0

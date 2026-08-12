@@ -234,9 +234,10 @@ def cluster_points_xy(points, mask, eps):
     return clusters
 
 
-def segment_trees(points, params, output_dir):
+def _segment_trees_core(points, params, output_dir):
     """
     Individual tree segmentation using trunk-based approach.
+    (核心算法：接受 points 数组，由 segment_trees 调用)
     """
     n = len(points)
     point_spacing = float(params.get('point_spacing', 0.05))
@@ -511,17 +512,31 @@ def segment_trees(points, params, output_dir):
     }
 
 
-def tree_segmentation_main(input_path, output_dir, params_json):
-    """Main entry point for tree segmentation."""
+def segment_trees(input_path, output_dir, params=None):
+    """
+    单木分割 API 入口（供 main.py FastAPI 调用）。
+    
+    参数：
+      input_path: 输入点云二进制文件路径（N×3 float32）
+      output_dir: 输出目录
+      params: 分割参数字典（trunk_straightness, trunk_curvature, min_tree_spacing, ...）
+    
+    返回：
+      包含 success, tree_count, trees, labels_file, total_assigned 等键的字典。
+      失败时抛出异常（不调用 sys.exit）。
+    """
     _log("=" * 60)
     _log("Individual Tree Segmentation (单木分割)")
     _log("=" * 60)
+    
+    if params is None:
+        params = {}
     
     # Load data
     data = np.fromfile(input_path, dtype=np.float32)
     n_pts = len(data) // 3
     if n_pts < 20:
-        _error_exit(f"Insufficient points: {n_pts} (minimum 20)")
+        raise ValueError(f"Insufficient points: {n_pts} (minimum 20)")
     
     points = data[:n_pts * 3].reshape(n_pts, 3).astype(np.float64)
     _log(f"  Input: {n_pts} points")
@@ -532,17 +547,14 @@ def tree_segmentation_main(input_path, output_dir, params_json):
     _log(f"  Estimated point spacing: {point_spacing:.4f}m")
     
     # Merge point_spacing into params
-    if isinstance(params_json, dict):
-        params_json['point_spacing'] = point_spacing
-    else:
-        params_json = {'point_spacing': point_spacing}
+    params['point_spacing'] = point_spacing
     
     os.makedirs(output_dir, exist_ok=True)
     
-    result = segment_trees(points, params_json, output_dir)
+    result = _segment_trees_core(points, params, output_dir)
     
-    result_json = _make_json_safe(result)
-    print(json.dumps(result_json, ensure_ascii=False), file=sys.stderr)
+    result = _make_json_safe(result)
+    _log(json.dumps(result, ensure_ascii=False))
     return result
 
 
@@ -596,7 +608,7 @@ if __name__ == '__main__':
                 pass
     
     try:
-        tree_segmentation_main(input_path, output_dir, params)
+        segment_trees(input_path, output_dir, params)
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
         _error_exit(f"Tree segmentation failed: {str(e)}")

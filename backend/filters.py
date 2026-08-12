@@ -181,112 +181,204 @@ def csf_filter_separate(points: np.ndarray, resolution: float = 0.5, threshold: 
     }
 
 
-def filter_points(input_path: str, output_path: str, method: str, params: dict):
+def _read_lasd(input_path):
+    """读取 LASD 二进制文件，返回 (points, has_colors, extra_attr_count, red, green, blue, intensity)"""
+    with open(input_path, 'rb') as f:
+        magic = f.read(4)
+        if magic != b'LASD':
+            raise ValueError('Invalid input format: expected LASD magic')
+
+        point_count = struct.unpack('<I', f.read(4))[0]
+        has_colors = struct.unpack('<B', f.read(1))[0]
+        extra_attr_count = struct.unpack('<B', f.read(1))[0]
+        f.read(6)  # reserved
+
+        points = np.fromfile(f, dtype=np.float32, count=point_count * 3).reshape(-1, 3)
+
+        remaining_data = f.read()
+        attr_size = point_count * 4
+        red = green = blue = intensity = None
+
+        offset = 0
+        if has_colors:
+            red = np.frombuffer(remaining_data[offset:offset + attr_size], dtype=np.float32).copy()
+            offset += attr_size
+            green = np.frombuffer(remaining_data[offset:offset + attr_size], dtype=np.float32).copy()
+            offset += attr_size
+            blue = np.frombuffer(remaining_data[offset:offset + attr_size], dtype=np.float32).copy()
+            offset += attr_size
+
+        if extra_attr_count > 0:
+            intensity = np.frombuffer(remaining_data[offset:offset + attr_size], dtype=np.float32).copy()
+
+    return points, has_colors, extra_attr_count, red, green, blue, intensity
+
+
+def _write_lasd(output_path, points, has_colors, has_intensity,
+                red=None, green=None, blue=None, intensity=None):
+    """写入 LASD 二进制文件"""
+    point_count = len(points)
+    with open(output_path, 'wb') as f:
+        f.write(b'LASD')
+        f.write(struct.pack('<I', point_count))
+        f.write(struct.pack('<B', 1 if has_colors else 0))
+        f.write(struct.pack('<B', 1 if has_intensity else 0))
+        f.write(b'\x00' * 6)
+
+        f.write(points.astype(np.float32).tobytes())
+
+        if has_colors and red is not None:
+            f.write(red.astype(np.float32).tobytes())
+            f.write(green.astype(np.float32).tobytes())
+            f.write(blue.astype(np.float32).tobytes())
+
+        if has_intensity and intensity is not None:
+            f.write(intensity.astype(np.float32).tobytes())
+
+
+def _execute_filter(points, method, params):
+    """根据方法名执行滤波，返回过滤后的索引数组"""
+    if method == 'statistical':
+        k = int(params.get('k', 20))
+        std_dev = float(params.get('std_dev', 1.0))
+        filtered_points = statistical_filter(points, k, std_dev)
+    elif method == 'gaussian':
+        sigma = float(params.get('sigma', 1.0))
+        radius = float(params.get('radius', 1.0))
+        filtered_points = gaussian_filter(points, sigma, radius)
+    elif method == 'csf':
+        resolution = float(params.get('resolution', 0.5))
+        threshold = float(params.get('threshold', 0.5))
+        max_iter = int(params.get('maxIter', 100))
+        filtered_points = csf_filter(points, resolution, threshold, max_iter)
+    elif method == 'radius':
+        try:
+            from scipy.spatial import cKDTree
+        except ImportError:
+            raise RuntimeError("scipy module not found")
+        radius = float(params.get('radius', 0.5))
+        min_neighbors = int(params.get('min_neighbors', 5))
+        tree = cKDTree(points)
+        counts = tree.query_ball_point(points, radius)
+        mask = np.array([len(c) >= min_neighbors for c in counts])
+        return np.where(mask)[0]
+    else:
+        raise ValueError(f"Unknown filter method: {method}")
+
+    # 对于返回点云的方法，反查保留点的索引
+    if len(filtered_points) == 0:
+        return np.array([], dtype=np.int64)
+    if len(filtered_points) >= len(points):
+        return np.arange(len(points))
+
+    # 使用 KD 树查找最近邻来确定保留的点
     try:
-        with open(input_path, 'rb') as f:
-            magic = f.read(4)
-            if magic != b'LASD':
-                raise ValueError('Invalid input format')
+        from scipy.spatial import cKDTree
+        tree = cKDTree(filtered_points)
+        dists, _ = tree.query(points, k=1)
+        filtered_indices = np.where(dists < 1e-6)[0]
+    except Exception:
+        # 暴力匹配
+        filtered_indices = np.array([], dtype=np.int64)
+        for i, point in enumerate(filtered_points):
+            matches = np.where(np.all(np.abs(points - point) < 1e-6, axis=1))[0]
+            if len(matches) > 0:
+                filtered_indices = np.append(filtered_indices, matches[0])
 
-            point_count = struct.unpack('<I', f.read(4))[0]
-            has_colors = struct.unpack('<B', f.read(1))[0]
-            extra_attr_count = struct.unpack('<B', f.read(1))[0]
-            f.read(6)
+    filtered_indices = np.unique(filtered_indices)
+    if len(filtered_indices) == 0:
+        filtered_indices = np.arange(min(len(filtered_points), len(points)))
+    return filtered_indices
 
-            points = np.fromfile(f, dtype=np.float32, count=point_count * 3)
-            points = points.reshape(-1, 3)
 
-            remaining_data = f.read()
-            attr_size = point_count * 4
-            red = green = blue = intensity = None
+# ================================================================
+# 模块级 API（供 main.py FastAPI 直接调用，不调用 sys.exit）
+# ================================================================
+def apply_filter(input_path: str, output_path: str, method: str, params: dict) -> dict:
+    """
+    执行点云滤波（单输出），供 FastAPI 调用。
+    成功返回包含 filtered_count 等信息的字典；失败抛出异常。
+    """
+    points, has_colors, extra_attr_count, red, green, blue, intensity = _read_lasd(input_path)
+    has_intensity = intensity is not None
 
-            offset = 0
-            if has_colors:
-                red = np.frombuffer(remaining_data[offset:offset + attr_size], dtype=np.float32)
-                offset += attr_size
-                green = np.frombuffer(remaining_data[offset:offset + attr_size], dtype=np.float32)
-                offset += attr_size
-                blue = np.frombuffer(remaining_data[offset:offset + attr_size], dtype=np.float32)
-                offset += attr_size
+    filtered_indices = _execute_filter(points, method, params)
 
-            if extra_attr_count > 0:
-                intensity = np.frombuffer(remaining_data[offset:offset + attr_size], dtype=np.float32)
+    filtered_points = points[filtered_indices]
+    filtered_red = red[filtered_indices] if red is not None else None
+    filtered_green = green[filtered_indices] if green is not None else None
+    filtered_blue = blue[filtered_indices] if blue is not None else None
+    filtered_intensity = intensity[filtered_indices] if intensity is not None else None
 
-        if method == 'statistical':
-            k = params.get('k', 20)
-            std_dev = params.get('std_dev', 1.0)
-            filtered_points = statistical_filter(points, k, std_dev)
-        elif method == 'gaussian':
-            sigma = params.get('sigma', 1.0)
-            radius = params.get('radius', 1.0)
-            filtered_points = gaussian_filter(points, sigma, radius)
-        elif method == 'csf':
-            resolution = params.get('resolution', 0.5)
-            threshold = params.get('threshold', 0.5)
-            max_iter = params.get('maxIter', 100)
-            filtered_points = csf_filter(points, resolution, threshold, max_iter)
-        elif method == 'radius':
-            # 保留原有的半径滤波支持
-            try:
-                from scipy.spatial import cKDTree
-            except ImportError:
-                print("Error: scipy module not found.", file=sys.stderr)
-                sys.exit(1)
-            radius = params.get('radius', 0.5)
-            min_neighbors = params.get('min_neighbors', 5)
-            tree = cKDTree(points)
-            counts = tree.query_ball_point(points, radius)
-            mask = np.array([len(c) >= min_neighbors for c in counts])
-            filtered_points = points[mask]
-        else:
-            raise ValueError(f"Unknown filter method: {method}")
+    _write_lasd(
+        output_path, filtered_points, has_colors, has_intensity,
+        red=filtered_red, green=filtered_green, blue=filtered_blue,
+        intensity=filtered_intensity,
+    )
 
-        # 找出保留点的索引
-        if len(filtered_points) > 0 and len(filtered_points) < len(points):
-            # 使用KD树查找最近邻来确定保留的点
-            try:
-                from scipy.spatial import cKDTree
-                tree = cKDTree(filtered_points)
-                dists, indices = tree.query(points, k=1)
-                filtered_indices = np.where(dists < 1e-6)[0]
-            except:
-                # 暴力匹配
-                filtered_indices = np.array([], dtype=np.int64)
-                for i, point in enumerate(filtered_points):
-                    matches = np.where(np.all(np.abs(points - point) < 1e-6, axis=1))[0]
-                    if len(matches) > 0:
-                        filtered_indices = np.append(filtered_indices, matches[0])
-            
-            filtered_indices = np.unique(filtered_indices)
-            if len(filtered_indices) == 0:
-                filtered_indices = np.arange(min(len(filtered_points), len(points)))
-        else:
-            filtered_indices = np.arange(len(points))
+    return {
+        'success': True,
+        'filtered_count': int(len(filtered_indices)),
+        'original_count': int(len(points)),
+        'method': method,
+    }
 
-        filtered_red = red[filtered_indices] if red is not None else None
-        filtered_green = green[filtered_indices] if green is not None else None
-        filtered_blue = blue[filtered_indices] if blue is not None else None
-        filtered_intensity = intensity[filtered_indices] if intensity is not None else None
 
-        with open(output_path, 'wb') as f:
-            f.write(b'LASD')
-            f.write(struct.pack('<I', len(filtered_indices)))
-            f.write(struct.pack('<B', 1 if has_colors else 0))
-            f.write(struct.pack('<B', 1 if intensity is not None else 0))
-            f.write(b'\x00' * 6)
+def apply_filter_separate(input_path: str, output_base: str, method: str, params: dict) -> dict:
+    """
+    执行 CSF 分离滤波，返回地面点和非地面点两个文件。
+    output_base: 输出路径前缀，会自动追加 _ground.bin 和 _nonground.bin
+    成功返回 {ground_count, non_ground_count, ground_path, non_ground_path}；失败抛出异常。
+    """
+    points, has_colors, extra_attr_count, red, green, blue, intensity = _read_lasd(input_path)
+    has_intensity = intensity is not None
 
-            f.write(points[filtered_indices].astype(np.float32).tobytes())
+    if method == 'csf_separate':
+        resolution = float(params.get('resolution', 0.5))
+        threshold = float(params.get('threshold', 0.5))
+        max_iter = int(params.get('maxIter', 100))
+        result = csf_filter_separate(points, resolution, threshold, max_iter)
+        ground_indices = result['ground_indices']
+        non_ground_indices = result['non_ground_indices']
+    else:
+        raise ValueError(f"Unknown separate filter method: {method}")
 
-            if has_colors and filtered_red is not None:
-                f.write(filtered_red.astype(np.float32).tobytes())
-                f.write(filtered_green.astype(np.float32).tobytes())
-                f.write(filtered_blue.astype(np.float32).tobytes())
+    ground_path = str(output_base) + '_ground.bin'
+    non_ground_path = str(output_base) + '_nonground.bin'
 
-            if intensity is not None and filtered_intensity is not None:
-                f.write(filtered_intensity.astype(np.float32).tobytes())
+    # 保存地面点
+    if len(ground_indices) > 0:
+        _write_lasd(
+            ground_path, points[ground_indices], has_colors, has_intensity,
+            red=red[ground_indices] if red is not None else None,
+            green=green[ground_indices] if green is not None else None,
+            blue=blue[ground_indices] if blue is not None else None,
+            intensity=intensity[ground_indices] if intensity is not None else None,
+        )
 
-        print(f"Success: {len(filtered_indices)} points remaining", file=sys.stderr)
+    # 保存非地面点
+    if len(non_ground_indices) > 0:
+        _write_lasd(
+            non_ground_path, points[non_ground_indices], has_colors, has_intensity,
+            red=red[non_ground_indices] if red is not None else None,
+            green=green[non_ground_indices] if green is not None else None,
+            blue=blue[non_ground_indices] if blue is not None else None,
+            intensity=intensity[non_ground_indices] if intensity is not None else None,
+        )
 
+    return {
+        'ground_count': int(len(ground_indices)),
+        'non_ground_count': int(len(non_ground_indices)),
+        'ground_path': ground_path,
+        'non_ground_path': non_ground_path,
+    }
+
+
+def filter_points(input_path: str, output_path: str, method: str, params: dict):
+    """CLI 兼容接口：执行滤波并在失败时 sys.exit(1)"""
+    try:
+        result = apply_filter(input_path, output_path, method, params)
+        print(f"Success: {result['filtered_count']} points remaining", file=sys.stderr)
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -294,103 +386,11 @@ def filter_points(input_path: str, output_path: str, method: str, params: dict):
         sys.exit(1)
 
 def filter_points_separate(input_path: str, output_dir: str, method: str, params: dict):
-    """分离滤波：返回地面点和非地面点两个文件"""
+    """CLI 兼容接口：分离滤波，返回地面点和非地面点两个文件"""
     try:
-        with open(input_path, 'rb') as f:
-            magic = f.read(4)
-            if magic != b'LASD':
-                raise ValueError('Invalid input format')
-
-            point_count = struct.unpack('<I', f.read(4))[0]
-            has_colors = struct.unpack('<B', f.read(1))[0]
-            extra_attr_count = struct.unpack('<B', f.read(1))[0]
-            f.read(6)
-
-            points = np.fromfile(f, dtype=np.float32, count=point_count * 3)
-            points = points.reshape(-1, 3)
-
-            remaining_data = f.read()
-            attr_size = point_count * 4
-            red = green = blue = intensity = None
-
-            offset = 0
-            if has_colors:
-                red = np.frombuffer(remaining_data[offset:offset + attr_size], dtype=np.float32)
-                offset += attr_size
-                green = np.frombuffer(remaining_data[offset:offset + attr_size], dtype=np.float32)
-                offset += attr_size
-                blue = np.frombuffer(remaining_data[offset:offset + attr_size], dtype=np.float32)
-                offset += attr_size
-
-            if extra_attr_count > 0:
-                intensity = np.frombuffer(remaining_data[offset:offset + attr_size], dtype=np.float32)
-
-        # 执行CSF分离滤波
-        if method == 'csf_separate':
-            resolution = params.get('resolution', 0.5)
-            threshold = params.get('threshold', 0.5)
-            max_iter = params.get('maxIter', 100)
-            
-            result = csf_filter_separate(points, resolution, threshold, max_iter)
-            ground_indices = result['ground_indices']
-            non_ground_indices = result['non_ground_indices']
-        else:
-            raise ValueError(f"Unknown separate filter method: {method}")
-
-        # 保存地面点
-        ground_path = output_dir + '_ground.bin'
-        if len(ground_indices) > 0:
-            ground_red = red[ground_indices] if red is not None else None
-            ground_green = green[ground_indices] if green is not None else None
-            ground_blue = blue[ground_indices] if blue is not None else None
-            ground_intensity = intensity[ground_indices] if intensity is not None else None
-
-            with open(ground_path, 'wb') as f:
-                f.write(b'LASD')
-                f.write(struct.pack('<I', len(ground_indices)))
-                f.write(struct.pack('<B', 1 if has_colors else 0))
-                f.write(struct.pack('<B', 1 if intensity is not None else 0))
-                f.write(b'\x00' * 6)
-                f.write(points[ground_indices].astype(np.float32).tobytes())
-                if has_colors and ground_red is not None:
-                    f.write(ground_red.astype(np.float32).tobytes())
-                    f.write(ground_green.astype(np.float32).tobytes())
-                    f.write(ground_blue.astype(np.float32).tobytes())
-                if intensity is not None and ground_intensity is not None:
-                    f.write(ground_intensity.astype(np.float32).tobytes())
-
-        # 保存非地面点
-        non_ground_path = output_dir + '_nonground.bin'
-        if len(non_ground_indices) > 0:
-            ng_red = red[non_ground_indices] if red is not None else None
-            ng_green = green[non_ground_indices] if green is not None else None
-            ng_blue = blue[non_ground_indices] if blue is not None else None
-            ng_intensity = intensity[non_ground_indices] if intensity is not None else None
-
-            with open(non_ground_path, 'wb') as f:
-                f.write(b'LASD')
-                f.write(struct.pack('<I', len(non_ground_indices)))
-                f.write(struct.pack('<B', 1 if has_colors else 0))
-                f.write(struct.pack('<B', 1 if intensity is not None else 0))
-                f.write(b'\x00' * 6)
-                f.write(points[non_ground_indices].astype(np.float32).tobytes())
-                if has_colors and ng_red is not None:
-                    f.write(ng_red.astype(np.float32).tobytes())
-                    f.write(ng_green.astype(np.float32).tobytes())
-                    f.write(ng_blue.astype(np.float32).tobytes())
-                if intensity is not None and ng_intensity is not None:
-                    f.write(ng_intensity.astype(np.float32).tobytes())
-
-        # 输出统计信息（用于后端返回）
+        result_info = apply_filter_separate(input_path, output_dir, method, params)
         import json
-        result_info = {
-            'ground_count': int(len(ground_indices)),
-            'non_ground_count': int(len(non_ground_indices)),
-            'ground_path': ground_path,
-            'non_ground_path': non_ground_path
-        }
         print(json.dumps(result_info), file=sys.stderr)
-
     except Exception as e:
         import traceback
         traceback.print_exc()

@@ -381,6 +381,20 @@ export const ClassifyIcon: React.FC<IconProps> = ({ size = 20, className }) => (
   </svg>
 )
 
+/** 地物分类模式 - 地面/分层图标 */
+export const GroundIcon: React.FC<IconProps> = ({ size = 20, className }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className}>
+    <path d="M2 18L8 8L14 14L22 6" stroke="#8B5CF6" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" fill="none"/>
+    <path d="M2 22h20" stroke="#8B5CF6" strokeWidth="2" strokeLinecap="round"/>
+    {/* 强度点 */}
+    <circle cx="6" cy="16" r="1.5" fill="#EF4444"/>
+    <circle cx="10" cy="11" r="1.5" fill="#10B981"/>
+    <circle cx="14" cy="14" r="1.5" fill="#3B82F6"/>
+    <circle cx="18" cy="9" r="1.5" fill="#F59E0B"/>
+    <circle cx="20" cy="7" r="1.5" fill="#EC4899"/>
+  </svg>
+)
+
 /** 单木分割 - 树形图标 */
 export const TreeIcon: React.FC<IconProps> = ({ size = 20, className }) => (
   <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className}>

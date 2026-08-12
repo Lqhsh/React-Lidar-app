@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { ClassifyIcon, TreeIcon, BuildingIcon } from '@/components/icons/ToolbarIcons'
+import { ClassifyIcon, TreeIcon, BuildingIcon, GroundIcon } from '@/components/icons/ToolbarIcons'
 import { useAppStore } from '@/store/appStore'
 import { FilterModal } from './FilterModal'
 
@@ -8,7 +8,53 @@ interface ClassifyModalProps {
   onClose: () => void
 }
 
-type SegmentMode = 'tree' | 'building'
+type SegmentMode = 'ground' | 'tree' | 'building'
+type ClassifyMethod = 'intensity' | 'geometric' | 'hybrid'
+
+const CATEGORY_LABELS: Record<string, string> = {
+  ground: '地面',
+  low_vegetation: '低矮植被',
+  tree: '树木',
+  building: '建筑物',
+  high_reflectivity: '高反射物',
+  other: '其他',
+}
+
+const GROUND_CLASSIFY_DESC = [
+  {
+    key: 'resolution',
+    label: '体素分辨率',
+    valueRange: 'm',
+    description: '下采样分辨率，值越大点越少，处理更快。0 表示不使用下采样。',
+    default: 0.5,
+    min: 0.0,
+    max: 5.0,
+    step: 0.1,
+    unit: 'm',
+  },
+  {
+    key: 'eps',
+    label: '聚类半径',
+    valueRange: 'm',
+    description: 'DBSCAN 聚类半径，控制同类物体的合并粒度。值越小分割越精细，值越大越易合并。',
+    default: 1.5,
+    min: 0.1,
+    max: 10.0,
+    step: 0.1,
+    unit: 'm',
+  },
+  {
+    key: 'minSamples',
+    label: '最小邻域数',
+    valueRange: '',
+    description: 'DBSCAN 最小邻域点数，小于此数的聚类将被视为噪声。',
+    default: 10,
+    min: 3,
+    max: 100,
+    step: 1,
+    unit: '',
+  },
+]
 
 const TREE_PARAMS_DESC = [
   {
@@ -142,11 +188,20 @@ export function ClassifyModal({ visible, onClose }: ClassifyModalProps) {
     isClassifying,
     selectedLayerId,
     layers,
+    classifyGroundObjects,
     segmentTrees,
     segmentBuildings,
   } = useAppStore()
 
-  const [mode, setMode] = useState<SegmentMode>('tree')
+  const [mode, setMode] = useState<SegmentMode>('ground')
+  const [classifyMethod, setClassifyMethod] = useState<ClassifyMethod>('intensity')
+  
+  // Ground classification parameters
+  const [groundParams, setGroundParams] = useState<Record<string, number>>({
+    resolution: 0.5,
+    eps: 1.5,
+    minSamples: 10,
+  })
   
   // Tree segmentation parameters
   const [treeParams, setTreeParams] = useState<Record<string, number>>({
@@ -174,7 +229,9 @@ export function ClassifyModal({ visible, onClose }: ClassifyModalProps) {
   const progressTimerRef = useRef<number | null>(null)
 
   const selectedLayer = layers.find(l => l.id === selectedLayerId)
-  const hasSelection = !!selectedLayerId && !!selectedLayer
+  const hasSelection = !!selectedLayerId && !!selectedLayerId && !!selectedLayer
+  
+  const hasIntensityData = !!(selectedLayer?.intensities && selectedLayer.intensities.length > 0)
 
   useEffect(() => {
     if (visible) {
@@ -220,7 +277,15 @@ export function ClassifyModal({ visible, onClose }: ClassifyModalProps) {
       setLocalProgress(0)
       setSegmentResults(null)
       
-      if (mode === 'tree') {
+      if (mode === 'ground') {
+        const results = await classifyGroundObjects(
+          groundParams.resolution,
+          groundParams.eps,
+          groundParams.minSamples,
+          classifyMethod,
+        )
+        setSegmentResults(results)
+      } else if (mode === 'tree') {
         const results = await segmentTrees(treeParams)
         setSegmentResults(results)
       } else {
@@ -234,7 +299,13 @@ export function ClassifyModal({ visible, onClose }: ClassifyModalProps) {
   }
 
   const handleReset = () => {
-    if (mode === 'tree') {
+    if (mode === 'ground') {
+      setGroundParams({
+        resolution: 0.5,
+        eps: 1.5,
+        minSamples: 10,
+      })
+    } else if (mode === 'tree') {
       setTreeParams({
         trunk_straightness: 0.65,
         trunk_curvature: 0.15,
@@ -258,29 +329,35 @@ export function ClassifyModal({ visible, onClose }: ClassifyModalProps) {
   }
 
   const isProcessing = isClassifying
-  const currentParams = mode === 'tree' ? TREE_PARAMS_DESC : BUILDING_PARAMS_DESC
-  const currentParamsState = mode === 'tree' ? treeParams : buildingParams
-  const setCurrentParams = mode === 'tree' ? setTreeParams : setBuildingParams
+  const currentParams = mode === 'ground' ? GROUND_CLASSIFY_DESC : (mode === 'tree' ? TREE_PARAMS_DESC : BUILDING_PARAMS_DESC)
+  const currentParamsState = mode === 'ground' ? groundParams : (mode === 'tree' ? treeParams : buildingParams)
+  const setCurrentParams = mode === 'ground' ? setGroundParams : (mode === 'tree' ? setTreeParams : setBuildingParams)
 
   const updateParam = (key: string, value: number) => {
     setCurrentParams((prev) => ({ ...prev, [key]: value }))
   }
 
-  const resultLabel = mode === 'tree' ? '棵树' : '栋建筑'
+  const resultLabel = mode === 'ground' ? '个实例' : (mode === 'tree' ? '棵树' : '栋建筑')
 
   return (
     <FilterModal
       visible={visible}
       onClose={onClose}
-      title={mode === 'tree' ? '单木分割' : '建筑分割'}
-      subtitle={mode === 'tree' 
-        ? '基于树干检测的单木提取，输出每棵树的独立点云及结构参数'
-        : '基于平面检测的建筑提取，输出每栋建筑的独立点云及几何参数'}
-      icon={mode === 'tree' ? <TreeIcon size={20} /> : <BuildingIcon size={20} />}
+      title={mode === 'ground' ? '地物分类' : (mode === 'tree' ? '单木分割' : '建筑分割')}
+      subtitle={
+        mode === 'ground'
+          ? '基于反射强度和几何特征的地物分类，将点云分为地面、植被、建筑物等类别'
+          : mode === 'tree'
+          ? '基于树干检测的单木提取，输出每棵树的独立点云及结构参数'
+          : '基于平面检测的建筑提取，输出每栋建筑的独立点云及几何参数'}
+      icon={mode === 'ground' ? <GroundIcon size={20} /> : mode === 'tree' ? <TreeIcon size={20} /> : <BuildingIcon size={20} />}
       variant="classify"
       isProcessing={isProcessing}
       progress={localProgress}
-      progressStatus={mode === 'tree' ? '正在进行单木分割...' : '正在进行建筑分割...'}
+      progressStatus={
+        mode === 'ground' ? '正在进行地物分类...' :
+        mode === 'tree' ? '正在进行单木分割...' : '正在进行建筑分割...'
+      }
       progressComplete={progressComplete && !isProcessing}
     >
       {!hasSelection ? (
@@ -320,15 +397,37 @@ export function ClassifyModal({ visible, onClose }: ClassifyModalProps) {
           {/* 分割模式选择 */}
           <div style={{
             display: 'flex',
-            gap: '8px',
+            gap: '6px',
             marginBottom: '12px',
           }}>
+            <button
+              onClick={() => { setMode('ground'); setSegmentResults(null); }}
+              className={`mode-tab ${mode === 'ground' ? 'active' : ''}`}
+              style={{
+                flex: 1,
+                padding: '8px 6px',
+                borderRadius: '8px',
+                border: mode === 'ground' ? '2px solid #8B5CF6' : '1px solid #CBD5E1',
+                background: mode === 'ground' ? '#F5F3FF' : 'white',
+                color: mode === 'ground' ? '#5B21B6' : '#64748B',
+                fontWeight: mode === 'ground' ? 600 : 400,
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: '4px',
+                fontSize: '12px',
+                transition: 'all 0.2s',
+              }}
+            >
+              地物分类
+            </button>
             <button
               onClick={() => { setMode('tree'); setSegmentResults(null); }}
               className={`mode-tab ${mode === 'tree' ? 'active' : ''}`}
               style={{
                 flex: 1,
-                padding: '10px',
+                padding: '8px 6px',
                 borderRadius: '8px',
                 border: mode === 'tree' ? '2px solid #10B981' : '1px solid #CBD5E1',
                 background: mode === 'tree' ? '#ECFDF5' : 'white',
@@ -338,8 +437,8 @@ export function ClassifyModal({ visible, onClose }: ClassifyModalProps) {
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
-                gap: '6px',
-                fontSize: '13px',
+                gap: '4px',
+                fontSize: '12px',
                 transition: 'all 0.2s',
               }}
             >
@@ -374,18 +473,27 @@ export function ClassifyModal({ visible, onClose }: ClassifyModalProps) {
             fontSize: '11px',
             color: '#475569',
             padding: '10px 12px',
-            background: mode === 'tree' 
+            background: mode === 'ground'
+              ? 'linear-gradient(135deg, #F5F3FF 0%, #FAF5FF 100%)'
+              : mode === 'tree'
               ? 'linear-gradient(135deg, #ECFDF5 0%, #F0FDF4 100%)'
               : 'linear-gradient(135deg, #FEF2F2 0%, #FFF7ED 100%)',
             borderRadius: '8px',
             marginBottom: '12px',
-            borderLeft: `3px solid ${mode === 'tree' ? '#10B981' : '#EF4444'}`,
+            borderLeft: `3px solid ${mode === 'ground' ? '#8B5CF6' : mode === 'tree' ? '#10B981' : '#EF4444'}`,
           }}>
-            <div style={{ fontWeight: 600, marginBottom: '6px', color: mode === 'tree' ? '#065F46' : '#991B1B' }}>
-              {mode === 'tree' ? '单木分割说明' : '建筑分割说明'}
+            <div style={{ fontWeight: 600, marginBottom: '6px', color: mode === 'ground' ? '#5B21B6' : mode === 'tree' ? '#065F46' : '#991B1B' }}>
+              {mode === 'ground' ? '地物分类说明' : mode === 'tree' ? '单木分割说明' : '建筑分割说明'}
             </div>
             <div style={{ color: '#64748B', lineHeight: '1.5' }}>
-              {mode === 'tree' ? (
+              {mode === 'ground' ? (
+                <>
+                  系统基于<strong style={{color:'#8B5CF6'}}>反射强度</strong>和<strong style={{color:'#8B5CF6'}}>高度联合阈值</strong>将点云分为地面、低矮植被、树木、建筑物、高反射物等类别，
+                  再通过<strong style={{color:'#8B5CF6'}}>DBSCAN 聚类</strong>分离各类实例。
+                  每个实例作为<strong style={{color:'#8B5CF6'}}>独立图层</strong>输出。
+                  {!hasIntensityData && <span style={{color:'#F59E0B'}}>（当前图层无强度数据，将使用几何分类）</span>}
+                </>
+              ) : mode === 'tree' ? (
                 <>
                   系统基于<strong style={{color:'#10B981'}}>树干垂直度检测</strong>识别树干候选点，
                   再通过<strong style={{color:'#10B981'}}>连通域聚类</strong>分离单木树干，
@@ -402,6 +510,74 @@ export function ClassifyModal({ visible, onClose }: ClassifyModalProps) {
               )}
             </div>
           </div>
+
+          {/* 分类方法选择 (仅地物分类模式显示) */}
+          {mode === 'ground' && (
+            <div style={{
+              display: 'flex',
+              gap: '4px',
+              marginBottom: '12px',
+              background: '#F1F5F9',
+              borderRadius: '8px',
+              padding: '3px',
+            }}>
+              <button
+                onClick={() => setClassifyMethod('intensity')}
+                disabled={!hasIntensityData}
+                style={{
+                  flex: 1,
+                  padding: '6px 8px',
+                  borderRadius: '6px',
+                  border: 'none',
+                  background: classifyMethod === 'intensity' ? 'white' : 'transparent',
+                  color: classifyMethod === 'intensity' ? '#5B21B6' : '#64748B',
+                  fontWeight: classifyMethod === 'intensity' ? 600 : 400,
+                  cursor: hasIntensityData ? 'pointer' : 'not-allowed',
+                  fontSize: '11px',
+                  boxShadow: classifyMethod === 'intensity' ? '0 1px 3px rgba(0,0,0,0.1)' : 'none',
+                  opacity: hasIntensityData ? 1 : 0.5,
+                }}
+              >
+                强度分类
+              </button>
+              <button
+                onClick={() => setClassifyMethod('geometric')}
+                style={{
+                  flex: 1,
+                  padding: '6px 8px',
+                  borderRadius: '6px',
+                  border: 'none',
+                  background: classifyMethod === 'geometric' ? 'white' : 'transparent',
+                  color: classifyMethod === 'geometric' ? '#5B21B6' : '#64748B',
+                  fontWeight: classifyMethod === 'geometric' ? 600 : 400,
+                  cursor: 'pointer',
+                  fontSize: '11px',
+                  boxShadow: classifyMethod === 'geometric' ? '0 1px 3px rgba(0,0,0,0.1)' : 'none',
+                }}
+              >
+                几何分类
+              </button>
+              <button
+                onClick={() => setClassifyMethod('hybrid')}
+                disabled={!hasIntensityData}
+                style={{
+                  flex: 1,
+                  padding: '6px 8px',
+                  borderRadius: '6px',
+                  border: 'none',
+                  background: classifyMethod === 'hybrid' ? 'white' : 'transparent',
+                  color: classifyMethod === 'hybrid' ? '#5B21B6' : '#64748B',
+                  fontWeight: classifyMethod === 'hybrid' ? 600 : 400,
+                  cursor: hasIntensityData ? 'pointer' : 'not-allowed',
+                  fontSize: '11px',
+                  boxShadow: classifyMethod === 'hybrid' ? '0 1px 3px rgba(0,0,0,0.1)' : 'none',
+                  opacity: hasIntensityData ? 1 : 0.5,
+                }}
+              >
+                混合分类
+              </button>
+            </div>
+          )}
 
           {/* 参数Tab切换 */}
           <div style={{
@@ -455,7 +631,7 @@ export function ClassifyModal({ visible, onClose }: ClassifyModalProps) {
                   <circle cx="12" cy="12" r="3" />
                   <path d="M12 1v6m0 6v6M4.22 4.22l4.24 4.24m7.08 7.08l4.24 4.24M1 12h6m6 0h6M4.22 19.78l4.24-4.24m7.08-7.08l4.24-4.24" />
                 </svg>
-                {mode === 'tree' ? '单木分割参数' : '建筑分割参数'}
+                {mode === 'ground' ? '地物分类参数' : mode === 'tree' ? '单木分割参数' : '建筑分割参数'}
               </div>
 
               {currentParams.map((param) => {
@@ -530,37 +706,42 @@ export function ClassifyModal({ visible, onClose }: ClassifyModalProps) {
           {segmentResults && segmentResults.length > 0 && (
             <div style={{
               padding: '12px',
-              background: mode === 'tree' ? '#F0FDF4' : '#FEF2F2',
+              background: mode === 'ground' ? '#F5F3FF' : mode === 'tree' ? '#F0FDF4' : '#FEF2F2',
               borderRadius: '8px',
               marginBottom: '12px',
-              border: `1px solid ${mode === 'tree' ? '#BBF7D0' : '#FECACA'}`,
+              border: `1px solid ${mode === 'ground' ? '#DDD6FE' : mode === 'tree' ? '#BBF7D0' : '#FECACA'}`,
             }}>
               <div style={{ 
                 fontWeight: 600, 
                 marginBottom: '8px', 
-                color: mode === 'tree' ? '#166534' : '#991B1B' 
+                color: mode === 'ground' ? '#5B21B6' : mode === 'tree' ? '#166534' : '#991B1B' 
               }}>
-                分割完成，共 {segmentResults.length} {resultLabel}
+                {mode === 'ground' ? '分类完成' : '分割完成'}，共 {segmentResults.length} {resultLabel}
               </div>
               <div style={{ fontSize: '11px', color: '#64748B', marginBottom: '10px' }}>
                 各实例已作为独立图层加载，可在图层管理中单独控制显示
               </div>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', maxHeight: '80px', overflowY: 'auto' }}>
-                {segmentResults.slice(0, 100).map((inst: any, idx: number) => (
-                  <span key={idx} style={{
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    padding: '2px 8px',
-                    background: mode === 'tree' ? '#D1FAE5' : '#FEE2E2',
-                    color: mode === 'tree' ? '#065F46' : '#991B1B',
-                    borderRadius: '10px',
-                    fontSize: '10px',
-                    fontWeight: 500,
-                  }}>
-                    {inst.label} · {inst.count?.toLocaleString() || 0}点
-                    {inst.height ? ` · H:${inst.height}m` : ''}
-                  </span>
-                ))}
+                {segmentResults.slice(0, 100).map((inst: any, idx: number) => {
+                  const catColor = mode === 'ground' 
+                    ? ({ ground: '#D97706', low_vegetation: '#34D399', tree: '#22C55E', building: '#EF4444', high_reflectivity: '#F59E0B', other: '#6B7280' } as Record<string, string>)[inst.category || 'other'] || '#D1FAE5'
+                    : mode === 'tree' ? '#D1FAE5' : '#FEE2E2'
+                  return (
+                    <span key={idx} style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      padding: '2px 8px',
+                      background: catColor + '22',
+                      color: catColor,
+                      borderRadius: '10px',
+                      fontSize: '10px',
+                      fontWeight: 500,
+                    }}>
+                      {inst.label || `${CATEGORY_LABELS[inst.category] || '实例'}${idx + 1}`} · {inst.count?.toLocaleString() || 0}点
+                      {inst.height ? ` · H:${inst.height}m` : ''}
+                    </span>
+                  )
+                })}
                 {segmentResults.length > 100 && (
                   <span style={{ padding: '2px 8px', color: '#94A3B8', fontSize: '10px' }}>
                     ...还有 {segmentResults.length - 100} 个
@@ -586,12 +767,15 @@ export function ClassifyModal({ visible, onClose }: ClassifyModalProps) {
               onClick={handleApply}
               disabled={!hasSelection || isProcessing}
               className={`filter-btn filter-btn-primary ${mode === 'tree' ? 'classify' : ''}`}
-              style={mode === 'building' ? { background: '#EF4444', borderColor: '#EF4444' } : {}}
+              style={
+                mode === 'building' ? { background: '#EF4444', borderColor: '#EF4444' } :
+                mode === 'ground' ? { background: '#8B5CF6', borderColor: '#8B5CF6' } : {}
+              }
             >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <polygon points="5 3 19 12 5 21 5 3" />
               </svg>
-              {isProcessing ? '分割中...' : (mode === 'tree' ? '执行单木分割' : '执行建筑分割')}
+              {isProcessing ? '处理中...' : (mode === 'ground' ? '执行地物分类' : mode === 'tree' ? '执行单木分割' : '执行建筑分割')}
             </button>
           </div>
         </>

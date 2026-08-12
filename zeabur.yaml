@@ -2,7 +2,7 @@
 # 文档：https://zeabur.com/docs
 # 使用方式：在 Zeabur Dashboard → 新建项目 → 选择 "从配置文件创建" 或连接 GitHub 仓库
 services:
-  # 后端服务：Node.js (Express) + Python (laspy/open3d) 混合服务
+  # 后端服务：FastAPI + Python（laspy/open3d 点云处理）
   - name: lidar-backend
     source:
       repo: Lqhsh/React-Lidar-app
@@ -11,10 +11,10 @@ services:
     build:
       type: docker
     run:
-      command: npm start
+      command: uvicorn main:app --host 0.0.0.0 --port 8080
     env:
-      NODE_ENV: production
-      PORT: "3001"
+      PORT: "8080"
+      HOST: "0.0.0.0"
     # 持久化存储（存储点云处理临时文件）
     volumes:
       - mountPath: /app/output

@@ -9,12 +9,12 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "8080:80"  # 本地 8080 → 容器 80
+      - "8080:8080"  # 本地 8080 → 容器 8080（nginx 监听 8080）
     depends_on:
       - backend
     environment:
-      # 通过 Docker 网络服务名访问后端
-      - BACKEND_URL=http://backend:3001
+      # 通过 Docker 网络服务名访问后端（后端容器内部监听 8080）
+      - BACKEND_URL=http://backend:8080
     networks:
       - lidar-network
 
@@ -23,12 +23,12 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     ports:
-      - "3001:3001"
+      - "3001:8080"  # 本地 3001 → 容器 8080（便于直接调试后端 API）
     networks:
       - lidar-network
     environment:
-      - NODE_ENV=production
-      - PORT=3001
+      - PORT=8080
+      - HOST=0.0.0.0
     volumes:
       - backend-output:/app/output
 

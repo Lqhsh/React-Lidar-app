@@ -437,5 +437,127 @@ def main():
         sys.exit(1)
 
 
+# ================================================================
+# 模块级 API（供 main.py FastAPI 直接调用）
+# ================================================================
+def read_header(filepath):
+    """读取 LAS 头信息，返回字典"""
+    if not LASPY_AVAILABLE:
+        raise RuntimeError("laspy module not available")
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"File not found: {filepath}")
+    las = _read_las_file(filepath)
+    return _get_header_info(las)
+
+
+def parse_las_simple(filepath, output_path):
+    """简单 LAS → XYZ float32 二进制转换"""
+    if not LASPY_AVAILABLE:
+        raise RuntimeError("laspy module not available")
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"File not found: {filepath}")
+    las = _read_las_file(filepath)
+    x = np.array(las.x, dtype=np.float32)
+    y = np.array(las.y, dtype=np.float32)
+    z = np.array(las.z, dtype=np.float32)
+    xyz = np.column_stack([x, y, z]).astype(np.float32)
+    xyz.tofile(output_path)
+    return {"success": True, "point_count": len(x)}
+
+
+def parse_las_to_lasd(
+    filepath,
+    output_path,
+    fields=None,
+    shift=None,
+    ignore_default=False,
+    force_8bit=False,
+    chunked=False,
+    max_points=None,
+    chunk_size=None,
+):
+    """按字段解析 LAS 文件，输出 LASD 二进制格式"""
+    if not LASPY_AVAILABLE:
+        raise RuntimeError("laspy module not available")
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"File not found: {filepath}")
+
+    las = _read_las_file(filepath)
+    point_count = int(len(las.points))
+
+    # 提取 XYZ
+    x = np.array(las.x, dtype=np.float64)
+    y = np.array(las.y, dtype=np.float64)
+    z = np.array(las.z, dtype=np.float64)
+
+    # 应用坐标平移
+    shift_applied = {"x": 0, "y": 0, "z": 0}
+    if shift:
+        x, y, z, was_shifted = _shift_coordinates(x, y, z, shift)
+        if was_shifted:
+            shift_applied = shift
+
+    # 确定要提取的额外字段
+    extra_segments = []
+    extra_attr_names = []
+
+    if fields:
+        # 用户指定字段
+        for field in fields:
+            field = field.strip()
+            data = _extract_field_data(las, field)
+            if data is not None:
+                if force_8bit and field in ("Red", "Green", "Blue"):
+                    data = np.clip(data, 0, 255).astype(np.float32)
+                else:
+                    data = data.astype(np.float32)
+                extra_segments.append(data)
+                extra_attr_names.append(FIELD_NAME_MAP.get(field, field).lower())
+    else:
+        # 默认：包含 intensity 和 classification（如果可用）
+        default_fields = []
+        dim_names = list(las.point_format.dimension_names)
+        if _find_dim(dim_names, "Intensity") is not None:
+            default_fields.append("Intensity")
+        if not ignore_default and _find_dim(dim_names, "Red") is not None:
+            default_fields.extend(["Red", "Green", "Blue"])
+        if _find_dim(dim_names, "Classification") is not None:
+            default_fields.append("Classification")
+
+        for field in default_fields:
+            data = _extract_field_data(las, field)
+            if data is not None:
+                if force_8bit and field in ("Red", "Green", "Blue"):
+                    data = np.clip(data, 0, 255).astype(np.float32)
+                else:
+                    data = data.astype(np.float32)
+                extra_segments.append(data)
+                extra_attr_names.append(FIELD_NAME_MAP.get(field, field).lower())
+
+    # 处理分块/子采样
+    if max_points and point_count > max_points:
+        stride = max(1, point_count // max_points)
+        indices = np.arange(0, point_count, stride)[:max_points]
+        x = x[indices]
+        y = y[indices]
+        z = z[indices]
+        extra_segments = [seg[indices] for seg in extra_segments]
+        point_count = len(x)
+
+    # 写入输出
+    _write_lasd_binary(output_path, x, y, z, extra_segments, extra_attr_names)
+
+    return {
+        "success": True,
+        "meta": {
+            "point_count": point_count,
+            "has_colors": int(any(n in ("red", "green", "blue") for n in extra_attr_names)),
+            "extra_attr_count": len(extra_segments),
+            "shift_applied": shift_applied,
+            "fields_parsed": extra_attr_names,
+        },
+    }
+
+
 if __name__ == '__main__':
     main()

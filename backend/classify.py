@@ -503,14 +503,14 @@ def classify_point_cloud(input_path, output_dir, voxel_size=0.05,
     data = np.fromfile(input_path, dtype=np.float32)
     n_pts = len(data) // 3
     if n_pts < 10:
-        _error_exit("Insufficient points (minimum 10)")
+        raise ValueError("Insufficient points (minimum 10)")
     
     points = data[:n_pts * 3].reshape(n_pts, 3).astype(np.float64)
     
     points, preprocess_stats = preprocess_points(points)
     
     if len(points) < 10:
-        _error_exit("Insufficient valid points after preprocessing")
+        raise ValueError("Insufficient valid points after preprocessing")
     
     z_min, z_max = float(points[:, 2].min()), float(points[:, 2].max())
     xy_extent = float(max(points[:, 0].max() - points[:, 0].min(),

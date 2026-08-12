@@ -351,15 +351,30 @@ def extract_buildings(points, output_dir, params):
     }
 
 
-def building_segmentation_main(input_path, output_dir, params_json):
+def segment_buildings(input_path, output_dir, params=None):
+    """
+    建筑分割 API 入口（供 main.py FastAPI 调用）。
+    
+    参数：
+      input_path: 输入点云二进制文件路径（N×3 float32）
+      output_dir: 输出目录
+      params: 分割参数字典（min_building_height, max_building_height, ...）
+    
+    返回：
+      包含 success, building_count, buildings, total_assigned 等键的字典。
+      失败时抛出异常（不调用 sys.exit）。
+    """
     _log("=" * 60)
     _log("Building Segmentation (建筑分割)")
     _log("=" * 60)
     
+    if params is None:
+        params = {}
+    
     data = np.fromfile(input_path, dtype=np.float32)
     n_pts = len(data) // 3
     if n_pts < 20:
-        _error_exit(f"Insufficient points: {n_pts}")
+        raise ValueError(f"Insufficient points: {n_pts}")
     
     points = data[:n_pts * 3].reshape(n_pts, 3).astype(np.float64)
     _log(f"  Input: {n_pts} points")
@@ -368,16 +383,13 @@ def building_segmentation_main(input_path, output_dir, params_json):
     point_spacing = estimate_point_spacing(points)
     _log(f"  Estimated point spacing: {point_spacing:.4f}m")
     
-    if isinstance(params_json, dict):
-        params_json['point_spacing'] = point_spacing
-    else:
-        params_json = {'point_spacing': point_spacing}
+    params['point_spacing'] = point_spacing
     
     os.makedirs(output_dir, exist_ok=True)
     
-    result = extract_buildings(points, output_dir, params_json)
-    result_json = _make_json_safe(result)
-    print(json.dumps(result_json, ensure_ascii=False), file=sys.stderr)
+    result = extract_buildings(points, output_dir, params)
+    result = _make_json_safe(result)
+    _log(json.dumps(result, ensure_ascii=False))
     return result
 
 
@@ -428,7 +440,7 @@ if __name__ == '__main__':
                 pass
     
     try:
-        building_segmentation_main(input_path, output_dir, params)
+        segment_buildings(input_path, output_dir, params)
     except Exception as e:
         traceback.print_exc(file=sys.stderr)
         _error_exit(f"Building segmentation failed: {str(e)}")
