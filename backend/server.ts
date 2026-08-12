@@ -11,8 +11,14 @@ const PORT = parseInt(process.env.PORT || '3001', 10)
 // ES Module 中获取 __dirname 的兼容写法
 const __dirname = decodeURIComponent(path.dirname(new URL(import.meta.url).pathname)).replace(/^\/([A-Za-z]:)/, '$1')
 
-// 虚拟环境 Python 路径
-const pythonPath = path.join(__dirname, 'venv', 'Scripts', 'python.exe')
+// Python 解释器路径（跨平台兼容）
+// - Windows 本地开发：使用项目内虚拟环境 venv/Scripts/python.exe
+// - Linux/Docker 容器：使用全局 python3（Dockerfile 中 pip install 全局安装）
+const isWindows = process.platform === 'win32'
+const venvPython = isWindows
+  ? path.join(__dirname, 'venv', 'Scripts', 'python.exe')
+  : path.join(__dirname, 'venv', 'bin', 'python')
+const pythonPath = fs.existsSync(venvPython) ? venvPython : (isWindows ? 'python' : 'python3')
 
 // 上传文件目录和输出目录
 const uploadDir = path.join(__dirname, 'uploads')
