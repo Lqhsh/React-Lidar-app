@@ -5,8 +5,10 @@ FROM node:20-alpine AS build
 WORKDIR /app
 
 # 安装依赖（利用 Docker 缓存层）
+# 必须安装 devDependencies（typescript、vite 等），否则 npm run build 会失败
+# Zeabur 可能在构建时注入 NODE_ENV=production，导致 npm ci 跳过 devDependencies
 COPY package.json package-lock.json* ./
-RUN npm ci
+RUN npm ci --include=dev
 
 # 构建生产版本
 COPY . .
