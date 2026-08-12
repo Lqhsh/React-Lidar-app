@@ -24,7 +24,7 @@ COPY nginx.conf /etc/nginx/conf.d/default.conf
 # 默认后端地址（本地构建时使用，Zeabur 部署会覆盖为后端公网 URL）
 ENV BACKEND_URL=http://localhost:3001
 
-EXPOSE 80
+EXPOSE 8080
 
 # 关键：启动时用 envsubst 精确替换 BACKEND_URL，保留 Nginx 内置变量
 # 如果不用 envsubst '变量名' 限定范围，所有 $xxx 会被清空 → 代理失效 → 502
