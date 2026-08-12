@@ -1399,10 +1399,10 @@ export const useAppStore = create<AppState>((set) => ({
         const combined = new Float32Array(pointCount * 4)
         combined.set(points, 0)
         combined.set(layer.intensities, pointCount * 3)
-        body = combined
+        body = combined as unknown as BodyInit
         hasIntensity = true
       } else {
-        body = points
+        body = points as unknown as BodyInit
       }
 
       const response = await fetch('/api/classify', {
