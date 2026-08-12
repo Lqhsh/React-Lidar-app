@@ -1263,7 +1263,7 @@ export const useAppStore = create<AppState>((set) => ({
           'Content-Type': 'application/octet-stream',
           'x-resolution': resolution.toString(),
         },
-        body: requestBody,
+        body: requestBody as unknown as BodyInit,
       })
 
       if (!response.ok) {
@@ -1391,7 +1391,7 @@ export const useAppStore = create<AppState>((set) => ({
       const points = layer.points
 
       // 构建请求体: XYZ + Intensity (如果有)
-      let body: ArrayBuffer
+      let body: BodyInit
       let hasIntensity = false
       if (layer.intensities && layer.intensities.length === points.length / 3) {
         // 合并 XYZ + Intensity 为一个二进制 payload
@@ -1399,10 +1399,10 @@ export const useAppStore = create<AppState>((set) => ({
         const combined = new Float32Array(pointCount * 4)
         combined.set(points, 0)
         combined.set(layer.intensities, pointCount * 3)
-        body = combined.buffer
+        body = combined
         hasIntensity = true
       } else {
-        body = points.slice().buffer
+        body = points
       }
 
       const response = await fetch('/api/classify', {
