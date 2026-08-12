@@ -18,6 +18,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 复制项目源码
 COPY . .
 
+# 复制本地数据文件（从项目根目录的本地数据目录）
+# 注意：在 Zeabur 上，构建上下文是 backend 目录
+# 所以需要将本地数据目录作为构建上下文的一部分
+COPY 本地数据 /app/本地数据
+
 # 创建输出目录（处理后的点云文件存放处）
 RUN mkdir -p output
 

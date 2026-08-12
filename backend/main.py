@@ -61,11 +61,22 @@ OUTPUT_DIR = Path(tempfile.gettempdir()) / "lidar_output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # 本地数据目录（项目根目录下的「本地数据」文件夹）
-# Docker 容器中通过 volume 挂载到 /app/本地数据
+# Docker 容器中通过 COPY 指令将本地数据复制到 /app/本地数据
 LOCAL_DATA_DIR = Path(__file__).resolve().parent.parent / "本地数据"
 if not LOCAL_DATA_DIR.exists():
     # Docker 环境下的备选路径
     LOCAL_DATA_DIR = Path("/app/本地数据")
+
+# 记录本地数据目录信息
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+logger.info(f"本地数据目录: {LOCAL_DATA_DIR}")
+if LOCAL_DATA_DIR.exists():
+    files = list(LOCAL_DATA_DIR.glob("*.las")) + list(LOCAL_DATA_DIR.glob("*.laz"))
+    logger.info(f"本地数据文件: {[f.name for f in files]}")
+else:
+    logger.warning(f"本地数据目录不存在: {LOCAL_DATA_DIR}")
 
 
 # ================================================================
@@ -181,26 +192,56 @@ async def list_local_data():
 
 
 @app.get("/api/local-data-file/{filename}")
-async def get_local_data_file(filename: str):
-    """下载本地数据文件"""
+async def get_local_data_file(filename: str, request: Request):
+    """下载本地数据文件（支持 gzip 压缩）"""
     # 安全检查：防止路径穿越
     if ".." in filename or "/" in filename or "\\" in filename:
         raise HTTPException(status_code=400, detail="非法文件名")
 
     file_path = LOCAL_DATA_DIR / filename
     if not file_path.exists():
-        raise HTTPException(status_code=404, detail="文件不存在")
-
-    def iterfile():
-        with open(file_path, "rb") as f:
-            while chunk := f.read(65536):
-                yield chunk
-
-    headers = {
-        "Content-Disposition": f'attachment; filename="{filename}"',
-        "X-File-Name": filename,
-    }
-    return StreamingResponse(iterfile(), media_type="application/octet-stream", headers=headers)
+        raise HTTPException(status_code=404, detail=f"文件不存在: {filename}")
+    
+    file_size = file_path.stat().st_size
+    
+    # 检查客户端是否支持 gzip
+    accept_encoding = request.headers.get("accept-encoding", "")
+    supports_gzip = "gzip" in accept_encoding.lower()
+    
+    if supports_gzip and file_size > 10240:  # 大于 10KB 时启用压缩
+        import gzip as gzip_module
+        
+        def iterfile_gzip():
+            with open(file_path, "rb") as f:
+                with gzip_module.GzipFile(fileobj=f, mode="rb") as gz:
+                    while True:
+                        chunk = gz.read(262144)  # 256KB chunks
+                        if not chunk:
+                            break
+                        yield chunk
+        
+        headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-File-Name": filename,
+            "Content-Encoding": "gzip",
+            "X-Original-Size": str(file_size),
+        }
+        return StreamingResponse(iterfile_gzip(), media_type="application/octet-stream", headers=headers)
+    else:
+        def iterfile():
+            with open(file_path, "rb") as f:
+                while True:
+                    chunk = f.read(262144)  # 256KB chunks
+                    if not chunk:
+                        break
+                    yield chunk
+        
+        headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-File-Name": filename,
+            "X-File-Size": str(file_size),
+        }
+        return StreamingResponse(iterfile(), media_type="application/octet-stream", headers=headers)
 
 
 # ================================================================
