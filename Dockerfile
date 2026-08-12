@@ -18,14 +18,14 @@ FROM nginx:alpine
 # 复制构建产物
 COPY --from=build /app/dist /usr/share/nginx/html
 
-# 使用 nginx 官方模板机制：放在 templates/ 目录下的 *.template 文件
-# 启动时会被 envsubst 处理，将 ${BACKEND_URL} 替换为环境变量值
-# 输出到 /etc/nginx/conf.d/default.conf
-COPY nginx.conf /etc/nginx/templates/default.conf.template
+# 复制 Nginx 配置（放在普通路径，不走默认 template 机制）
+COPY nginx.conf /etc/nginx/conf.d/default.conf
 
-# 默认后端地址（本地构建时使用，Render 部署会覆盖为后端公网 URL）
+# 默认后端地址（本地构建时使用，Zeabur 部署会覆盖为后端公网 URL）
 ENV BACKEND_URL=http://localhost:3001
 
 EXPOSE 80
 
-CMD ["nginx", "-g", "daemon off;"]
+# 关键：启动时用 envsubst 精确替换 BACKEND_URL，保留 Nginx 内置变量
+# 如果不用 envsubst '变量名' 限定范围，所有 $xxx 会被清空 → 代理失效 → 502
+CMD ["/bin/sh", "-c", "envsubst '${BACKEND_URL}' < /etc/nginx/conf.d/default.conf > /tmp/nginx.conf && mv /tmp/nginx.conf /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'"]
