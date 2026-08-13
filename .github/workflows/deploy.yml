@@ -1,6 +1,5 @@
-# CI 构建检查 - 验证代码可编译
-# CD 持续部署由 Render Blueprint 自动完成（render.yaml 中 autoDeploy: true）
-# 部署步骤：在 Render Dashboard → New → Blueprint → 选择仓库
+# CI 构建检查 - 验证前端可编译、后端 Python 语法正确
+# 部署由 Zeabur 自动完成（zeabur.yaml 中 autoDeploy: true）
 name: CI Build Check
 
 on:
@@ -28,8 +27,13 @@ jobs:
       - name: Build frontend (tsc + vite build)
         run: npm run build
 
-      - name: Check backend TypeScript
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Check backend Python syntax
         working-directory: backend
         run: |
-          npm ci
-          npx tsc --noEmit
+          pip install py_compile_deps || true
+          python -m py_compile main.py parse_las.py filters.py classify.py height_normalize.py tree_segment.py building_segment.py las_export.py
