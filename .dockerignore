@@ -4,7 +4,9 @@ dist
 .gitignore
 backend/venv
 backend/__pycache__
-本地数据
+# 注意：不再排除「本地数据」目录，以便 Docker 构建时可根据需要 COPY 内置示例数据。
+# 如不想将数据打包进镜像，可保留下一行注释，改为通过运行时 volume 挂载。
+# 本地数据
 *.las
 *.laz
 *.bin

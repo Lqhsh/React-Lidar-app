@@ -29,8 +29,15 @@ services:
     environment:
       - PORT=8080
       - HOST=0.0.0.0
+      # 显式指定输出目录，匹配下面 volume 挂载点；main.py 会读取此 env
+      - OUTPUT_DIR=/app/output
+      # 显式指定内置示例数据目录：可通过挂载主机目录或独立 volume 提供
+      - LOCAL_DATA_DIR=/app/本地数据
     volumes:
       - backend-output:/app/output
+      # 如需将主机的「本地数据」目录直接映射，可取消下一行注释并修改路径
+      # - ./本地数据:/app/本地数据:ro
+      - backend-localdata:/app/本地数据
 
 networks:
   lidar-network:
@@ -38,3 +45,4 @@ networks:
 
 volumes:
   backend-output:
+  backend-localdata:

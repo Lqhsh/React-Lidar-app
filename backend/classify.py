@@ -606,6 +606,398 @@ def _make_json_safe(obj):
 
 
 # ================================================================
+# Intensity-based & Hybrid Classification (added 2026-08)
+# ---------------------------------------------------------------
+# 本模块将 main.py 中内联实现的强度/混合分类算法统一收敛到 classify.py。
+# - _INTENSITY_CATEGORY_CONFIG: 强度分类专用配置（含 min_intensity/height_range/eps/min_points）
+# - _intensity_save_instance:   实例保存（与 _save_instance 并行，避免改动既有几何分类输出格式）
+# - classify_by_intensity:      公开模块级入口（供 FastAPI main.py 直接调用，无 sys.exit、无文件 IO）
+# - classify_hybrid:            公开模块级入口（强度 + 几何细化占位）
+# ================================================================
+
+# 分类类别配置（强度分类专用：与上方 CATEGORY_CONFIG 字段不同、用途不同，
+# 保留独立前缀避免与既有几何分类 CATEGORY_CONFIG 重名冲突）
+_INTENSITY_CATEGORY_CONFIG = {
+    "ground": {
+        "label": "地面",
+        "file_prefix": "ground",
+        "min_intensity": 0,
+        "max_intensity": 200,
+        "height_range": (0, 0.5),
+        "min_points": 5,
+        "eps": 0.3,
+    },
+    "low_vegetation": {
+        "label": "低矮植被",
+        "file_prefix": "low_veg",
+        "min_intensity": 10,
+        "max_intensity": 120,
+        "height_range": (0.1, 2.0),
+        "min_points": 5,
+        "eps": 0.5,
+    },
+    "tree": {
+        "label": "树木",
+        "file_prefix": "tree",
+        "min_intensity": 10,
+        "max_intensity": 200,
+        "height_range": (1.0, 50.0),
+        "min_points": 5,
+        "eps": 0.8,
+    },
+    "building": {
+        "label": "建筑物",
+        "file_prefix": "building",
+        "min_intensity": 80,
+        "max_intensity": 65535,
+        "height_range": (1.5, 200.0),
+        "min_points": 5,
+        "eps": 2.0,
+    },
+    "high_reflectivity": {
+        "label": "高反射物",
+        "file_prefix": "high_ref",
+        "min_intensity": 200,
+        "max_intensity": 65535,
+        "height_range": (0, 200.0),
+        "min_points": 3,
+        "eps": 1.0,
+    },
+    "other": {
+        "label": "其他",
+        "file_prefix": "other",
+        "min_intensity": 0,
+        "max_intensity": 65535,
+        "height_range": (0, 1000.0),
+        "min_points": 3,
+        "eps": 1.0,
+    },
+}
+
+
+def _intensity_save_instance(points, category, category_label, instance_id, output_dir):
+    """保存强度分类实例为 .bin 文件（与几何分类独立命名，避免格式互相覆盖）"""
+    cfg = _INTENSITY_CATEGORY_CONFIG.get(category, _INTENSITY_CATEGORY_CONFIG["other"])
+    prefix = cfg["file_prefix"]
+    filename = f"{prefix}_{instance_id}.bin"
+    filepath = os.path.join(output_dir, filename)
+
+    sub = np.asarray(points, dtype=np.float32)
+    sub.tofile(filepath)
+
+    z_vals = sub[:, 2]
+    count = int(len(sub))
+    return {
+        "category": category,
+        "category_label": category_label,
+        "instance_id": int(instance_id),
+        "label": f"{category_label}{instance_id}",
+        "count": count,
+        "file": filename,
+        "z_min": float(z_vals.min()) if count > 0 else 0,
+        "z_max": float(z_vals.max()) if count > 0 else 0,
+        "z_mean": float(z_vals.mean()) if count > 0 else 0,
+    }
+
+
+def _robust_normalize_intensities(intensities):
+    """稳健强度归一化：百分位数截断，避免 min-max 极端值干扰。"""
+    int_min = float(np.percentile(intensities, 1))
+    int_max = float(np.percentile(intensities, 99))
+    int_range = int_max - int_min
+
+    if int_range < 1e-8:
+        norm = np.full(len(intensities), 0.5, dtype=np.float32)
+    else:
+        norm = np.clip((intensities - int_min) / int_range, 0.0, 1.0).astype(np.float32)
+
+    return norm, int_min, int_max
+
+
+def _compute_adaptive_thresholds(norm_int, norm_z):
+    """基于强度+高度的联合分布自适应计算分类阈值。"""
+    p5 = float(np.percentile(norm_int, 5))
+    p10 = float(np.percentile(norm_int, 10))
+    p20 = float(np.percentile(norm_int, 20))
+    p30 = float(np.percentile(norm_int, 30))
+    p50 = float(np.percentile(norm_int, 50))
+    p70 = float(np.percentile(norm_int, 70))
+    p85 = float(np.percentile(norm_int, 85))
+    p95 = float(np.percentile(norm_int, 95))
+
+    z_p5 = float(np.percentile(norm_z, 5))
+    z_p10 = float(np.percentile(norm_z, 10))
+    z_p20 = float(np.percentile(norm_z, 20))
+    z_p30 = float(np.percentile(norm_z, 30))
+    z_p40 = float(np.percentile(norm_z, 40))
+    z_p50 = float(np.percentile(norm_z, 50))
+
+    return {
+        'ground_int_max': p30,
+        'ground_z_max': z_p20,
+        'low_veg_int_min': p5,
+        'low_veg_int_max': p50,
+        'low_veg_z_min': z_p5,
+        'low_veg_z_max': z_p40,
+        'tree_int_min': p20,
+        'tree_int_max': p85,
+        'tree_z_min': z_p20,
+        'building_int_min': p60,
+        'building_z_min': z_p40,
+        'high_ref_int_min': p95,
+        'max_intensity': float(norm_int.max()),
+        'min_intensity': float(norm_int.min()),
+    }
+
+
+def _run_intensity_classify_core(points, intensities, output_dir, eps, min_samples, resolution):
+    """强度分类核心流程（内部函数，不做 HTTP、无 sys.exit）。"""
+    os.makedirs(output_dir, exist_ok=True)
+    n_pts = len(points)
+    if n_pts < 10:
+        raise ValueError(f"点数量不足: {n_pts}")
+
+    # Step 1: 稳健强度归一化
+    norm_int, raw_p1, raw_p99 = _robust_normalize_intensities(intensities)
+
+    # Step 2: 高度分布归一化
+    z_vals = points[:, 2]
+    z_min_val = float(z_vals.min())
+    z_max_val = float(z_vals.max())
+    z_range = z_max_val - z_min_val
+
+    if z_range < 1e-8:
+        norm_z = np.full(n_pts, 0.5, dtype=np.float32)
+    else:
+        norm_z = ((z_vals - z_min_val) / z_range).astype(np.float32)
+
+    # Step 3: 自适应参数
+    xy_extent = float(max(
+        points[:, 0].max() - points[:, 0].min(),
+        points[:, 1].max() - points[:, 1].min(),
+    ))
+    point_spacing = max(0.01, xy_extent / max(1, n_pts ** 0.5))
+    adaptive_eps = max(0.2, point_spacing * 8)
+    adaptive_min_samples = max(3, int(1.5 / (point_spacing + 1e-6)))
+    thresholds = _compute_adaptive_thresholds(norm_int, norm_z)
+
+    # Step 4: 多步骤语义分类（地面 → 低矮植被 → 建筑 → 树木 → 高反射 → 补充分类 → 其他）
+    semantic_labels = np.full(n_pts, "other", dtype=object)
+    assigned = np.zeros(n_pts, dtype=bool)
+
+    ground_z_mask = norm_z < thresholds['ground_z_max']
+    ground_int_mask = norm_int < thresholds['ground_int_max']
+    ground_mask = ground_z_mask & ground_int_mask & (~assigned)
+    if ground_mask.sum() > 0:
+        semantic_labels[ground_mask] = "ground"
+        assigned[ground_mask] = True
+
+    low_veg_z_mask = (norm_z >= thresholds['low_veg_z_min']) & (norm_z < thresholds['low_veg_z_max'])
+    low_veg_int_mask = (norm_int >= thresholds['low_veg_int_min']) & (norm_int < thresholds['low_veg_int_max'])
+    low_veg_mask = low_veg_z_mask & low_veg_int_mask & (~assigned)
+    if low_veg_mask.sum() > 0:
+        semantic_labels[low_veg_mask] = "low_vegetation"
+        assigned[low_veg_mask] = True
+
+    building_z_mask = norm_z >= thresholds['building_z_min']
+    building_int_mask = norm_int >= thresholds['building_int_min']
+    building_mask = building_z_mask & building_int_mask & (~assigned)
+    if building_mask.sum() > 0:
+        semantic_labels[building_mask] = "building"
+        assigned[building_mask] = True
+
+    tree_z_mask = norm_z >= thresholds['tree_z_min']
+    tree_int_mask = (norm_int >= thresholds['tree_int_min']) & (norm_int < thresholds['tree_int_max'])
+    tree_mask = tree_z_mask & tree_int_mask & (~assigned)
+    if tree_mask.sum() > 0:
+        semantic_labels[tree_mask] = "tree"
+        assigned[tree_mask] = True
+
+    high_ref_mask = (norm_int >= thresholds['high_ref_int_min']) & (~assigned)
+    if high_ref_mask.sum() > 0:
+        semantic_labels[high_ref_mask] = "high_reflectivity"
+        assigned[high_ref_mask] = True
+
+    unassigned = ~assigned
+    if unassigned.sum() > 0:
+        low_z_u = unassigned & (norm_z < thresholds['ground_z_max'])
+        if low_z_u.sum() > 0:
+            semantic_labels[low_z_u] = "ground"
+            assigned[low_z_u] = True
+        mid_z_u = unassigned & (norm_z >= thresholds['low_veg_z_min']) & (norm_z < thresholds['tree_z_min'])
+        if mid_z_u.sum() > 0:
+            semantic_labels[mid_z_u] = "low_vegetation"
+            assigned[mid_z_u] = True
+        high_z_u = unassigned & (norm_z >= thresholds['tree_z_min'])
+        if high_z_u.sum() > 0:
+            semantic_labels[high_z_u] = "tree"
+            assigned[high_z_u] = True
+
+    semantic_labels[~assigned] = "other"
+
+    # Step 5: 对每个类别做 XY 平面 DBSCAN 聚类（地面直接存 1 个大实例）
+    instances = []
+    unique_categories = list(dict.fromkeys(semantic_labels.tolist()))
+
+    for cat_name in unique_categories:
+        cat_mask = semantic_labels == cat_name
+        cat_points = points[cat_mask]
+        if len(cat_points) < 3:
+            continue
+        cat_cfg = _INTENSITY_CATEGORY_CONFIG.get(cat_name, _INTENSITY_CATEGORY_CONFIG["other"])
+
+        if cat_name == "ground":
+            if len(cat_points) >= 1:
+                instances.append(_intensity_save_instance(
+                    cat_points, cat_name, cat_cfg["label"], 1, output_dir))
+            continue
+
+        min_pts_threshold = max(3, cat_cfg.get("min_points", adaptive_min_samples))
+        if len(cat_points) < min_pts_threshold:
+            if len(cat_points) >= 1:
+                instances.append(_intensity_save_instance(
+                    cat_points, cat_name, cat_cfg["label"], 1, output_dir))
+            continue
+
+        try:
+            from scipy.spatial import cKDTree
+            xy_coords = cat_points[:, :2]
+            tree = cKDTree(xy_coords)
+            eps_val = cat_cfg.get("eps", adaptive_eps)
+            if eps_val <= 0:
+                eps_val = adaptive_eps
+
+            n_cat = len(cat_points)
+            visited = np.zeros(n_cat, dtype=bool)
+            cluster_ids = np.full(n_cat, -1, dtype=np.int32)
+            cluster_id = 0
+            min_pts = max(3, min_pts_threshold)
+
+            for i in range(n_cat):
+                if visited[i]:
+                    continue
+                neighbors = tree.query_ball_point(xy_coords[i], eps_val)
+                if len(neighbors) < min_pts:
+                    continue
+                cluster_id += 1
+                visited[i] = True
+                cluster_ids[i] = cluster_id
+                queue = list(neighbors)
+                while queue:
+                    j = queue.pop(0)
+                    if not visited[j]:
+                        visited[j] = True
+                        j_neighbors = tree.query_ball_point(xy_coords[j], eps_val)
+                        if len(j_neighbors) >= min_pts:
+                            for nn in j_neighbors:
+                                if nn not in queue:
+                                    queue.append(nn)
+                    if cluster_ids[j] == -1:
+                        cluster_ids[j] = cluster_id
+
+            unique_clusters = sorted({int(c) for c in cluster_ids if c >= 0})
+            cat_inst_count = 0
+            for cid in unique_clusters:
+                cluster_mask = cluster_ids == cid
+                cluster_pts = cat_points[cluster_mask]
+                if len(cluster_pts) >= min_pts:
+                    cat_inst_count += 1
+                    instances.append(_intensity_save_instance(
+                        cluster_pts, cat_name, cat_cfg["label"],
+                        cat_inst_count, output_dir))
+
+            noise_mask = cluster_ids == -1
+            if noise_mask.any():
+                noise_pts = cat_points[noise_mask]
+                if len(noise_pts) >= min_pts:
+                    cat_inst_count += 1
+                    instances.append(_intensity_save_instance(
+                        noise_pts, cat_name, cat_cfg["label"],
+                        cat_inst_count, output_dir))
+                elif cat_inst_count > 0:
+                    existing = [(i, inst) for i, inst in enumerate(instances) if inst["category"] == cat_name]
+                    if existing:
+                        largest_idx = max(existing, key=lambda x: x[1]["count"])[0]
+                        existing_file = os.path.join(output_dir, instances[largest_idx]["file"])
+                        try:
+                            old_data = np.fromfile(existing_file, dtype=np.float32).reshape(-1, 3)
+                            merged = np.vstack([old_data, noise_pts.astype(np.float32)])
+                            merged.tofile(existing_file)
+                            instances[largest_idx]["count"] = len(merged)
+                            instances[largest_idx]["z_min"] = float(merged[:, 2].min())
+                            instances[largest_idx]["z_max"] = float(merged[:, 2].max())
+                            instances[largest_idx]["z_mean"] = float(merged[:, 2].mean())
+                        except Exception:
+                            cat_inst_count += 1
+                            instances.append(_intensity_save_instance(
+                                noise_pts, cat_name, cat_cfg["label"],
+                                cat_inst_count, output_dir))
+        except ImportError:
+            instances.append(_intensity_save_instance(
+                cat_points, cat_name, cat_cfg["label"], 1, output_dir))
+
+    # Step 6: 结果统计
+    total_classified = sum(inst["count"] for inst in instances)
+    category_summary = {}
+    for cat_name in list(_INTENSITY_CATEGORY_CONFIG.keys()):
+        cat_instances = [i for i in instances if i["category"] == cat_name]
+        if cat_instances:
+            total_pts = sum(i["count"] for i in cat_instances)
+            category_summary[cat_name] = {
+                "label": _INTENSITY_CATEGORY_CONFIG[cat_name]["label"],
+                "count": total_pts,
+                "instances": len(cat_instances),
+            }
+
+    return {
+        "total_points": int(n_pts),
+        "point_spacing": float(point_spacing),
+        "total_instances": len(instances),
+        "classified_points": int(total_classified),
+        "categories": category_summary,
+        "instances": instances,
+        "mode": "intensity",
+        "intensity_range": [float(intensities.min()), float(intensities.max())],
+        "adaptive_thresholds": thresholds,
+    }
+
+
+def classify_by_intensity(points, intensities, output_dir, eps=1.5, min_samples=10, resolution=1.0):
+    """
+    模块级入口：基于反射强度的点云分类（供 FastAPI 直接调用）。
+    失败抛 ValueError / ImportError / RuntimeError，不调用 sys.exit，不写日志，不做 HTTP。
+
+    Args:
+        points:       N×3 ndarray，XYZ 点坐标
+        intensities:  N 长度 ndarray，反射强度值
+        output_dir:   实例 .bin 输出目录（会自动创建）
+        eps:          DBSCAN eps 提示（函数会自适应，仅作兜底）
+        min_samples:  DBSCAN min_samples 提示
+        resolution:   网格分辨率（保留参数）
+
+    Returns:
+        dict（与原先 main.py 中 _classify_by_intensity 返回的结构完全一致，保证兼容）
+    """
+    return _run_intensity_classify_core(
+        points, intensities, output_dir,
+        eps=eps, min_samples=min_samples, resolution=resolution,
+    )
+
+
+def classify_hybrid(points, intensities, output_dir, eps=1.5, min_samples=10, resolution=1.0):
+    """
+    模块级入口：混合分类（强度 + 几何占位）。
+    当前实现：先强度分类，返回结果标记为 hybrid 模式。
+    """
+    result = classify_by_intensity(
+        points, intensities, output_dir,
+        eps=eps, min_samples=min_samples, resolution=resolution,
+    )
+    result["mode"] = "hybrid"
+    return result
+
+
+# ================================================================
 # CLI Entry Point
 # ================================================================
 if __name__ == '__main__':

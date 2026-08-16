@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { ClassifyIcon, TreeIcon, BuildingIcon, GroundIcon } from '@/components/icons/ToolbarIcons'
 import { useAppStore } from '@/store/appStore'
+import type { DlPipelineMeta } from '@/store/appStore'
 import { FilterModal } from './FilterModal'
 
 interface ClassifyModalProps {
@@ -191,6 +192,12 @@ export function ClassifyModal({ visible, onClose }: ClassifyModalProps) {
     classifyGroundObjects,
     segmentTrees,
     segmentBuildings,
+    dlPipelineMeta,
+    dlLabelFilters,
+    dlColoringMode,
+    setDlLabelFilter,
+    setDlColoringMode,
+    clearDlPipelineMeta,
   } = useAppStore()
 
   const [mode, setMode] = useState<SegmentMode>('ground')
@@ -778,8 +785,269 @@ export function ClassifyModal({ visible, onClose }: ClassifyModalProps) {
               {isProcessing ? '处理中...' : (mode === 'ground' ? '执行地物分类' : mode === 'tree' ? '执行单木分割' : '执行建筑分割')}
             </button>
           </div>
+
+          {/* ============== RandLA-Net 深度学习管线结果面板 ============== */}
+          {dlPipelineMeta && <DlResultPanel
+            pipeline={dlPipelineMeta}
+            labelFilters={dlLabelFilters}
+            coloringMode={dlColoringMode}
+            onToggleFilter={setDlLabelFilter}
+            onChangeColoring={setDlColoringMode}
+            onClear={clearDlPipelineMeta}
+          />}
         </>
       )}
     </FilterModal>
+  )
+}
+
+/* ============================================================
+   子组件：RandLA-Net 深度学习管线结果交互面板
+   - 按 LAS classification 标签过滤显示
+   - 按 label / TreeID / BuildingID 切换着色模式
+   - 下载后端标记的 LAS / Meta JSON
+   ============================================================ */
+function DlResultPanel(props: {
+  pipeline: DlPipelineMeta
+  labelFilters: Record<number, boolean>
+  coloringMode: 'label' | 'treeId' | 'buildingId'
+  onToggleFilter: (code: number, checked: boolean) => void
+  onChangeColoring: (mode: 'label' | 'treeId' | 'buildingId') => void
+  onClear: () => void
+}) {
+  const { pipeline, labelFilters, coloringMode, onToggleFilter, onChangeColoring, onClear } = props
+
+  const treeInstanceCount = pipeline.instanceSummary.filter(i => i.lasCode === 5 || i.category === 'tree').reduce((s, i) => s + i.count, 0)
+  const buildingInstanceCount = pipeline.instanceSummary.filter(i => i.lasCode === 6 || i.category === 'building').reduce((s, i) => s + i.count, 0)
+  const totalInstances = pipeline.instanceSummary.reduce((s, i) => s + i.count, 0)
+
+  const coloringOptions: { value: typeof coloringMode; label: string; desc: string }[] = [
+    { value: 'label',      label: '按标签着色',  desc: '地面/植被/树木/建筑按标准色显示' },
+    { value: 'treeId',     label: '按 TreeID',   desc: '仅显示树木，按单木实例着色' },
+    { value: 'buildingId', label: '按 BuildingID', desc: '仅显示建筑，按单栋实例着色' },
+  ]
+
+  return (
+    <div style={{
+      marginTop: '16px',
+      padding: '12px',
+      borderRadius: '10px',
+      background: 'linear-gradient(135deg, #EEF2FF 0%, #F5F3FF 100%)',
+      border: '1px solid #C7D2FE',
+      boxShadow: '0 1px 2px rgba(99, 102, 241, 0.08)',
+    }}>
+      {/* 标题栏 */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <div style={{
+            width: '28px', height: '28px', borderRadius: '8px',
+            background: 'linear-gradient(135deg, #6366F1, #8B5CF6)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            color: 'white', fontWeight: 700, fontSize: '12px',
+          }}>
+            DL
+          </div>
+          <div>
+            <div style={{ fontWeight: 700, color: '#3730A3', fontSize: '13px' }}>
+              RandLA-Net 深度学习分类结果
+            </div>
+            <div style={{ fontSize: '11px', color: '#6366F1', marginTop: '1px' }}>
+              {pipeline.pointCount.toLocaleString()} 点 · 共 {totalInstances} 个实例
+              {treeInstanceCount > 0 && <> · 🌲 {treeInstanceCount} 树</>}
+              {buildingInstanceCount > 0 && <> · 🏢 {buildingInstanceCount} 建筑</>}
+            </div>
+          </div>
+        </div>
+        <button
+          onClick={onClear}
+          title="清空管线元数据（不会删除已加载图层）"
+          style={{
+            padding: '4px 8px',
+            fontSize: '11px',
+            borderRadius: '6px',
+            border: '1px solid #C7D2FE',
+            background: 'white',
+            color: '#6366F1',
+            cursor: 'pointer',
+          }}
+        >
+          清空
+        </button>
+      </div>
+
+      {/* 标签过滤区 */}
+      <div style={{ marginBottom: '12px' }}>
+        <div style={{ fontSize: '11px', fontWeight: 600, color: '#3730A3', marginBottom: '6px' }}>
+          按 LAS 标签过滤显示
+        </div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+          {pipeline.categorySummary.map((cat) => {
+            const checked = !!labelFilters[cat.lasCode]
+            return (
+              <label
+                key={cat.lasCode}
+                title={`${cat.label} · ${cat.count.toLocaleString()}点 (${cat.percentage.toFixed(1)}%)`}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                  padding: '4px 8px',
+                  borderRadius: '999px',
+                  background: checked ? 'white' : '#E0E7FF',
+                  border: `1px solid ${checked ? cat.color : '#C7D2FE'}`,
+                  cursor: 'pointer',
+                  opacity: checked ? 1 : 0.6,
+                  transition: 'all 0.15s',
+                  fontSize: '11px',
+                  userSelect: 'none',
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  onChange={(e) => onToggleFilter(cat.lasCode, e.target.checked)}
+                  style={{ cursor: 'pointer', margin: 0 }}
+                />
+                <span
+                  style={{
+                    width: '10px', height: '10px', borderRadius: '50%',
+                    background: cat.color,
+                    border: cat.color === '#FFFFFF' || cat.color === '#ffffff' ? '1px solid #CBD5E1' : 'none',
+                    flexShrink: 0,
+                  }}
+                />
+                <span style={{ color: '#1E293B', fontWeight: 500 }}>{cat.label}</span>
+                <span style={{ color: '#64748B', fontSize: '10px' }}>
+                  {cat.percentage.toFixed(1)}%
+                </span>
+              </label>
+            )
+          })}
+        </div>
+      </div>
+
+      {/* 着色模式切换 */}
+      <div style={{ marginBottom: '12px' }}>
+        <div style={{ fontSize: '11px', fontWeight: 600, color: '#3730A3', marginBottom: '6px' }}>
+          着色模式
+        </div>
+        <div style={{ display: 'flex', gap: '4px', background: '#E0E7FF', borderRadius: '8px', padding: '3px' }}>
+          {coloringOptions.map((opt) => {
+            const active = coloringMode === opt.value
+            return (
+              <button
+                key={opt.value}
+                onClick={() => onChangeColoring(opt.value)}
+                title={opt.desc}
+                style={{
+                  flex: 1,
+                  padding: '6px 4px',
+                  fontSize: '11px',
+                  fontWeight: active ? 600 : 400,
+                  borderRadius: '6px',
+                  border: 'none',
+                  background: active ? 'white' : 'transparent',
+                  color: active ? '#4338CA' : '#6366F1',
+                  cursor: 'pointer',
+                  boxShadow: active ? '0 1px 3px rgba(99,102,241,0.15)' : 'none',
+                }}
+              >
+                {opt.label}
+              </button>
+            )
+          })}
+        </div>
+        <div style={{ fontSize: '10px', color: '#6366F1', marginTop: '4px', lineHeight: 1.4 }}>
+          {coloringOptions.find(o => o.value === coloringMode)?.desc}
+        </div>
+      </div>
+
+      {/* 下载按钮区 */}
+      <div>
+        <div style={{ fontSize: '11px', fontWeight: 600, color: '#3730A3', marginBottom: '6px' }}>
+          下载标记产物（LAS/JSON）
+        </div>
+        <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+          <a
+            href={pipeline.outputLasUrl}
+            download
+            style={{
+              flex: 1,
+              minWidth: '130px',
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: '6px',
+              padding: '6px 10px',
+              fontSize: '11px',
+              fontWeight: 600,
+              borderRadius: '6px',
+              background: '#4F46E5',
+              color: 'white',
+              textDecoration: 'none',
+              cursor: 'pointer',
+            }}
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="7 10 12 15 17 10" />
+              <line x1="12" y1="15" x2="12" y2="3" />
+            </svg>
+            下载 LAS (带标签)
+          </a>
+          <a
+            href={pipeline.outputMetaUrl}
+            download
+            style={{
+              flex: 1,
+              minWidth: '130px',
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: '6px',
+              padding: '6px 10px',
+              fontSize: '11px',
+              fontWeight: 600,
+              borderRadius: '6px',
+              background: 'white',
+              color: '#4338CA',
+              textDecoration: 'none',
+              cursor: 'pointer',
+              border: '1px solid #C7D2FE',
+            }}
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+              <polyline points="14 2 14 8 20 8" />
+              <line x1="16" y1="13" x2="8" y2="13" />
+              <line x1="16" y1="17" x2="8" y2="17" />
+            </svg>
+            下载 Meta (JSON)
+          </a>
+        </div>
+        {/* 坐标信息 */}
+        <div style={{
+          marginTop: '10px',
+          padding: '8px 10px',
+          background: 'white',
+          borderRadius: '6px',
+          border: '1px solid #C7D2FE',
+          fontSize: '10px',
+          color: '#4C1D95',
+          lineHeight: 1.5,
+        }}>
+          <div><strong>原始坐标范围：</strong>
+            X [{pipeline.originalBounds.min[0].toFixed(2)}, {pipeline.originalBounds.max[0].toFixed(2)}] ·
+            Y [{pipeline.originalBounds.min[1].toFixed(2)}, {pipeline.originalBounds.max[1].toFixed(2)}] ·
+            Z [{pipeline.originalBounds.min[2].toFixed(2)}, {pipeline.originalBounds.max[2].toFixed(2)}] m
+          </div>
+          <div style={{ marginTop: '2px' }}>
+            <strong>推理平移量：</strong>
+            dx={pipeline.shiftX.toFixed(3)} dy={pipeline.shiftY.toFixed(3)} dz={pipeline.shiftZ.toFixed(3)} m
+            （输出 LAS 已复原为原始大地坐标）
+          </div>
+        </div>
+      </div>
+    </div>
   )
 }

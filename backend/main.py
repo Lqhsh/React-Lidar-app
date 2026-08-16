@@ -48,24 +48,59 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(title="LiDAR 点云处理后端", version="2.0.0")
 
 # CORS 配置（允许前端跨域访问）
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# 注意：浏览器规范禁止 allow_origins=["*"] 与 allow_credentials=True 同时生效
+# （详见 Fetch Standard 对 Access-Control-Allow-Credentials 的约束），
+# 之前两者共存会导致 FastAPI/Starlette 警告、且带凭证请求在浏览器端被拒绝。
+# 由于生产环境前端通过 Nginx 同源反代 /api/，CORS 本身不触发；
+# 开发环境 Vite proxy 也走同源；仅在直接前后端跨域调试时生效。
+# 如需支持带凭证的跨域请求，请改为指定具体的 allow_origins 列表（从 env 读取）。
+_cors_origins_env = os.environ.get("CORS_ALLOW_ORIGINS")
+if _cors_origins_env:
+    _cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+else:
+    _cors_origins = ["*"]
+
+if _cors_origins == ["*"]:
+    # 通配符 origin → 必须去掉 allow_credentials
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    # 具体 origin 列表 → 允许带凭证
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # 输出目录（处理后的临时文件存放处）
-OUTPUT_DIR = Path(tempfile.gettempdir()) / "lidar_output"
+# 优先级：1) 环境变量 OUTPUT_DIR → 2) 系统临时目录下的 lidar_output
+# Docker / Zeabur 下通过 env 注入 OUTPUT_DIR=/app/output 以匹配 volume 挂载点
+_env_output_dir = os.environ.get("OUTPUT_DIR")
+if _env_output_dir:
+    OUTPUT_DIR = Path(_env_output_dir)
+else:
+    OUTPUT_DIR = Path(tempfile.gettempdir()) / "lidar_output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# 本地数据目录（项目根目录下的「本地数据」文件夹）
-# Docker 容器中通过 COPY 指令将本地数据复制到 /app/本地数据
-LOCAL_DATA_DIR = Path(__file__).resolve().parent.parent / "本地数据"
-if not LOCAL_DATA_DIR.exists():
-    # Docker 环境下的备选路径
-    LOCAL_DATA_DIR = Path("/app/本地数据")
+# 本地数据目录（内置示例数据）
+# 优先级：1) 环境变量 LOCAL_DATA_DIR
+#         2) 源码相对路径 <项目根>/本地数据（本地开发场景）
+#         3) Docker 挂载路径 /app/本地数据
+_env_local_data = os.environ.get("LOCAL_DATA_DIR")
+if _env_local_data:
+    LOCAL_DATA_DIR = Path(_env_local_data)
+else:
+    LOCAL_DATA_DIR = Path(__file__).resolve().parent.parent / "本地数据"
+    if not LOCAL_DATA_DIR.exists():
+        # Docker 环境下的备选路径（volume 挂载点）
+        LOCAL_DATA_DIR = Path("/app/本地数据")
 
 # 记录本地数据目录信息
 import logging
@@ -82,9 +117,39 @@ else:
 # ================================================================
 # 工具函数
 # ================================================================
+def _sanitize_filename(filename: Optional[str]) -> str:
+    """
+    安全清理上传文件名，防止路径穿越与非法字符。
+
+    策略（与 las-export 端点文件名清理逻辑保持一致）：
+    1) 替换非 [中英文、数字、下划线、点、短横] 的字符为 _
+    2) 去掉开头的连续 '.' 与 '/' '\\'，杜绝 ../ 与绝对路径
+    3) 空文件名则回退到 'upload'
+    """
+    import re
+    if not filename:
+        return "upload"
+    # 只保留安全字符：中英文、数字、下划线、点、短横
+    cleaned = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fa5_.-]+", "_", filename)
+    # 剥去开头的路径分隔与点，防止 ../ 穿越
+    cleaned = cleaned.lstrip("/\\.")
+    if not cleaned:
+        cleaned = "upload"
+    return cleaned
+
+
 def _save_upload_to_temp(upload_file: UploadFile, suffix: str = ".bin") -> Path:
-    """将上传的文件保存到临时路径"""
-    temp_path = OUTPUT_DIR / f"{int(time.time() * 1000)}_{upload_file.filename}"
+    """将上传的文件保存到临时路径（带路径穿越防护）"""
+    safe_name = _sanitize_filename(upload_file.filename)
+    # 时间戳 + 安全文件名
+    temp_path = OUTPUT_DIR / f"{int(time.time() * 1000)}_{safe_name}"
+    # 二次校验：解析后的绝对路径必须仍在 OUTPUT_DIR 之内，杜绝穿越
+    resolved = temp_path.resolve()
+    output_resolved = OUTPUT_DIR.resolve()
+    try:
+        resolved.relative_to(output_resolved)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="非法文件名：路径越界")
     with open(temp_path, "wb") as f:
         shutil.copyfileobj(upload_file.file, f)
     return temp_path
@@ -129,6 +194,75 @@ def _encode_meta_header(meta_info: dict) -> str:
     """
     json_str = json.dumps(meta_info, ensure_ascii=False)
     return urllib.parse.quote(json_str, safe='')
+
+
+def _ascii_safe_filename(filename: str) -> str:
+    """将文件名转换为仅 ASCII 的"兜底文件名"，用于 HTTP 头的 filename= 字段。
+
+    非 ASCII 字符会被替换成 ``_``，扩展名尽量保留。
+    例如：``森林.las`` -> ``__.las``，``数据 (1).las`` -> ``___1_.las``
+    """
+    stem, ext = os.path.splitext(filename)
+    safe_stem = "".join(ch if ord(ch) < 128 else "_" for ch in stem)
+    return (safe_stem or "download") + ext
+
+
+def _content_disposition_header(filename: str) -> str:
+    """构建符合 RFC 6266 / 5987 的 Content-Disposition 响应头。
+
+    - ``filename=`` 使用安全的 ASCII 兜底名（老浏览器兼容）
+    - ``filename*=UTF-8''`` 使用百分号编码的原名（主流浏览器会显示中文名）
+
+    这样既能保证 header 可被 latin-1 编码（避免 starlette UnicodeEncodeError），
+    又能在下载对话框中显示正确的中文文件名。
+    """
+    ascii_name = _ascii_safe_filename(filename)
+    encoded = urllib.parse.quote(filename, safe='')
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded}"
+
+
+def _iter_file_chunks(file_path: Path, chunk_size: int = 262144):
+    """以二进制分块读取磁盘文件（普通下载分支）。"""
+    with open(file_path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
+
+
+def _iter_file_chunks_gzip(file_path: Path, chunk_size: int = 262144):
+    """以二进制分块读取磁盘文件，并使用 gzip 实时压缩输出。
+
+    注意：**读取的是原始 LAS/LAZ 明文并压缩后返回**，
+    因此 ``Content-Encoding: gzip`` 需要与实际压缩体对应。
+    （原实现误用 ``GzipFile(mode='rb')`` 去 *解* 压一个未压缩文件，
+    会导致 32KB 左右就报 "Not a gzipped file" 500。）
+    """
+    import gzip as _gzip
+
+    # 我们不直接返回 gzip.compress(f.read())，避免一次把大 LAS 全部读入内存。
+    # 使用 GzipFile(mode='wb') 写入到一个 BytesIO，按 chunk_size 把压缩结果 yield 出去。
+    import io
+
+    buf = io.BytesIO()
+    with open(file_path, "rb") as f_in:
+        with _gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=6) as gz:
+            while True:
+                raw = f_in.read(chunk_size)
+                if not raw:
+                    break
+                gz.write(raw)
+                # 每写入一块后，把当前 buf 里已经被 flush 出的压缩字节取出来
+                data = buf.getvalue()
+                if data:
+                    yield data
+                    buf.seek(0)
+                    buf.truncate(0)
+        # 退出 with 块时 GzipFile 会写 gzip trailer；再把 buf 里剩余的尾字节取走
+        tail = buf.getvalue()
+        if tail:
+            yield tail
 
 
 # ================================================================
@@ -193,7 +327,17 @@ async def list_local_data():
 
 @app.get("/api/local-data-file/{filename}")
 async def get_local_data_file(filename: str, request: Request):
-    """下载本地数据文件（支持 gzip 压缩）"""
+    """下载本地数据文件（支持 gzip 传输压缩）。
+
+    修复要点（避免再次出现 HTTP 500）：
+    1. 所有响应头均使用 ASCII/latin-1 可编码值；中文文件名走
+       RFC 5987 ``filename*=UTF-8''...`` 传递，防止 starlette 报
+       ``UnicodeEncodeError('latin-1', ...)``。
+    2. ``Content-Encoding: gzip`` 分支原先用 ``GzipFile(mode='rb')``
+       对"未压缩的 LAS"解压，语义完全写反；现改为实时 *压缩* 输出。
+    3. 迭代器异常兜底：任何分块读取异常都落盘 traceback 并重新抛出，
+       避免 StreamingResponse 在"首次 yield 时"才炸、前端只能看到空 500。
+    """
     # 安全检查：防止路径穿越
     if ".." in filename or "/" in filename or "\\" in filename:
         raise HTTPException(status_code=400, detail="非法文件名")
@@ -201,47 +345,63 @@ async def get_local_data_file(filename: str, request: Request):
     file_path = LOCAL_DATA_DIR / filename
     if not file_path.exists():
         raise HTTPException(status_code=404, detail=f"文件不存在: {filename}")
-    
-    file_size = file_path.stat().st_size
-    
+
+    try:
+        file_size = file_path.stat().st_size
+    except OSError as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"无法读取文件元数据: {e}")
+
+    # 公共 headers（全部 ASCII 安全）
+    base_headers = {
+        "Content-Disposition": _content_disposition_header(filename),
+        "X-File-Name": urllib.parse.quote(filename, safe=''),
+        "X-File-Size": str(file_size),
+    }
+
     # 检查客户端是否支持 gzip
-    accept_encoding = request.headers.get("accept-encoding", "")
+    accept_encoding = request.headers.get("accept-encoding", "") or ""
     supports_gzip = "gzip" in accept_encoding.lower()
-    
-    if supports_gzip and file_size > 10240:  # 大于 10KB 时启用压缩
-        import gzip as gzip_module
-        
-        def iterfile_gzip():
-            with open(file_path, "rb") as f:
-                with gzip_module.GzipFile(fileobj=f, mode="rb") as gz:
-                    while True:
-                        chunk = gz.read(262144)  # 256KB chunks
-                        if not chunk:
-                            break
-                        yield chunk
-        
-        headers = {
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "X-File-Name": filename,
-            "Content-Encoding": "gzip",
-            "X-Original-Size": str(file_size),
-        }
-        return StreamingResponse(iterfile_gzip(), media_type="application/octet-stream", headers=headers)
+
+    if supports_gzip and file_size > 10240:  # 大于 10KB 时启用传输压缩
+        headers = dict(base_headers)
+        headers["Content-Encoding"] = "gzip"
+        headers["X-Original-Size"] = str(file_size)
+
+        def iterfile_gzip_safe():
+            try:
+                yield from _iter_file_chunks_gzip(file_path)
+            except Exception:
+                traceback.print_exc()
+                raise
+
+        try:
+            return StreamingResponse(
+                iterfile_gzip_safe(),
+                media_type="application/octet-stream",
+                headers=headers,
+            )
+        except Exception as e:
+            # StreamingResponse.__init__ 基本不会抛，这里兜底一下
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=str(e))
     else:
-        def iterfile():
-            with open(file_path, "rb") as f:
-                while True:
-                    chunk = f.read(262144)  # 256KB chunks
-                    if not chunk:
-                        break
-                    yield chunk
-        
-        headers = {
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "X-File-Name": filename,
-            "X-File-Size": str(file_size),
-        }
-        return StreamingResponse(iterfile(), media_type="application/octet-stream", headers=headers)
+        def iterfile_safe():
+            try:
+                yield from _iter_file_chunks(file_path)
+            except Exception:
+                traceback.print_exc()
+                raise
+
+        try:
+            return StreamingResponse(
+                iterfile_safe(),
+                media_type="application/octet-stream",
+                headers=base_headers,
+            )
+        except Exception as e:
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 # ================================================================
@@ -503,56 +663,36 @@ async def height_normalize(
         resolution = 1.0
 
     try:
-        # 读取二进制数据为 numpy 数组
-        # 注意：np.frombuffer 返回只读数组（buffer 是不可变的），需要 .copy() 才能修改
-        data = np.frombuffer(body, dtype=np.float32)
-        if data.size < 3:
-            raise HTTPException(status_code=400, detail="数据点数不足")
+        # 算法统一收敛到 height_normalize 模块（消除与 height_normalize.py 的并行重复实现）
+        sys.path.insert(0, str(Path(__file__).parent))
+        from height_normalize import normalize_height as _hn_norm
 
+        # 读取二进制数据为 numpy 数组（np.frombuffer 返回只读视图，传给模块后会内部 astype(copy=True)）
+        data = np.frombuffer(body, dtype=np.float32)
         if data.size % 3 != 0:
             raise HTTPException(
                 status_code=400,
                 detail=f"数据大小 {data.size} 不是 3 的倍数",
             )
+        points_1d = data.reshape(-1)
 
-        points = data.reshape(-1, 3).copy()  # 关键：copy() 使数组可写
-        point_count = points.shape[0]
+        normalized, meta = _hn_norm(points_1d, resolution=resolution)
 
-        # 计算原始统计信息
-        min_z = float(np.min(points[:, 2]))
-        max_z = float(np.max(points[:, 2]))
-
-        # 执行归一化：Z 轴减去最小值
-        if abs(min_z) > 1e-8:
-            points[:, 2] -= min_z
-
-        new_min_z = float(np.min(points[:, 2]))
-        new_max_z = float(np.max(points[:, 2]))
-
-        # 输出归一化后的二进制数据
-        output_bytes = points.astype(np.float32).tobytes()
-
-        meta_info = {
-            "success": True,
-            "pointCount": point_count,
-            "originalMinZ": min_z,
-            "originalMaxZ": max_z,
-            "normalizedMinZ": new_min_z,
-            "normalizedMaxZ": new_max_z,
-            "shiftApplied": min_z,
-            "resolution": resolution,
-            "inputBytes": len(body),
-        }
+        # 补齐请求级元数据（模块只返回算法内字段）
+        meta["inputBytes"] = len(body)
 
         headers = {
-            "X-Meta-Info": _encode_meta_header(meta_info),
+            "X-Meta-Info": _encode_meta_header(meta),
         }
-
+        output_bytes = normalized.astype(np.float32).tobytes()
         return Response(
             content=output_bytes,
             media_type="application/octet-stream",
             headers=headers,
         )
+    except ValueError as e:
+        # 模块抛出的 ValueError（如 <3 个点、shape 不合法）→ 400 客户端错误
+        raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:
@@ -643,13 +783,19 @@ async def classify_point_cloud(
 
     try:
         # 根据模式选择分类方法
+        # 说明：强度分类 / 混合分类已统一收敛到 classify.py 模块（classify_by_intensity /
+        # classify_hybrid），main.py 只负责路由 + 协议解析，不再内联算法实现。
+        # 几何分类（classify_point_cloud）也位于同一模块，三个入口保持一致的 lazy import
+        # 风格，避免模块级依赖缺失时整体不可用。
         if classify_mode == "intensity" and intensities is not None:
-            result_info = _classify_by_intensity(
+            from classify import classify_by_intensity as _c_by_intensity
+            result_info = _c_by_intensity(
                 points, intensities, str(cls_output_dir),
                 eps=eps, min_samples=min_samples, resolution=resolution,
             )
         elif classify_mode == "hybrid" and intensities is not None:
-            result_info = _classify_hybrid(
+            from classify import classify_hybrid as _c_hybrid
+            result_info = _c_hybrid(
                 points, intensities, str(cls_output_dir),
                 eps=eps, min_samples=min_samples, resolution=resolution,
             )
@@ -724,468 +870,42 @@ async def classify_point_cloud(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ================================================================
-# 强度分类核心函数
-# ================================================================
-def _save_classify_instance(points, category, category_label, instance_id, output_dir):
-    """保存分类实例为 .bin 文件（raw XYZ float32）"""
-    cfg = _CATEGORY_CONFIG.get(category, _CATEGORY_CONFIG["other"])
-    prefix = cfg["file_prefix"]
-    filename = f"{prefix}_{instance_id}.bin"
-    filepath = os.path.join(output_dir, filename)
-
-    sub = np.asarray(points, dtype=np.float32)
-    sub.tofile(filepath)
-
-    z_vals = sub[:, 2]
-    count = int(len(sub))
-    return {
-        "category": category,
-        "category_label": category_label,
-        "instance_id": int(instance_id),
-        "label": f"{category_label}{instance_id}",
-        "count": count,
-        "file": filename,
-        "z_min": float(z_vals.min()) if count > 0 else 0,
-        "z_max": float(z_vals.max()) if count > 0 else 0,
-        "z_mean": float(z_vals.mean()) if count > 0 else 0,
-    }
-
-
-# 分类类别配置
-_CATEGORY_CONFIG = {
-    "ground": {
-        "label": "地面",
-        "file_prefix": "ground",
-        "min_intensity": 0,
-        "max_intensity": 200,
-        "height_range": (0, 0.5),
-        "min_points": 5,
-        "eps": 0.3,
-    },
-    "low_vegetation": {
-        "label": "低矮植被",
-        "file_prefix": "low_veg",
-        "min_intensity": 10,
-        "max_intensity": 120,
-        "height_range": (0.1, 2.0),
-        "min_points": 5,
-        "eps": 0.5,
-    },
-    "tree": {
-        "label": "树木",
-        "file_prefix": "tree",
-        "min_intensity": 10,
-        "max_intensity": 200,
-        "height_range": (1.0, 50.0),
-        "min_points": 5,
-        "eps": 0.8,
-    },
-    "building": {
-        "label": "建筑物",
-        "file_prefix": "building",
-        "min_intensity": 80,
-        "max_intensity": 65535,
-        "height_range": (1.5, 200.0),
-        "min_points": 5,
-        "eps": 2.0,
-    },
-    "high_reflectivity": {
-        "label": "高反射物",
-        "file_prefix": "high_ref",
-        "min_intensity": 200,
-        "max_intensity": 65535,
-        "height_range": (0, 200.0),
-        "min_points": 3,
-        "eps": 1.0,
-    },
-    "other": {
-        "label": "其他",
-        "file_prefix": "other",
-        "min_intensity": 0,
-        "max_intensity": 65535,
-        "height_range": (0, 1000.0),
-        "min_points": 3,
-        "eps": 1.0,
-    },
-}
-
-
-def _robust_normalize_intensities(intensities):
-    """
-    稳健的强度归一化：使用百分位数而非min-max，避免极端值干扰。
-    返回 [0, 1] 范围内的归一化强度值。
-    """
-    int_min = float(np.percentile(intensities, 1))
-    int_max = float(np.percentile(intensities, 99))
-    int_range = int_max - int_min
-    
-    if int_range < 1e-8:
-        # 所有强度几乎相同
-        norm = np.full(len(intensities), 0.5, dtype=np.float32)
-    else:
-        norm = np.clip((intensities - int_min) / int_range, 0.0, 1.0).astype(np.float32)
-    
-    return norm, int_min, int_max
-
-
-def _compute_adaptive_thresholds(norm_int, norm_z):
-    """
-    基于数据分布自适应计算分类阈值（改进版）。
-    
-    核心思路：
-    - 地面：低高度 + 低强度（地面通常是最底部的点）
-    - 低矮植被：中低高度 + 中低强度
-    - 树木：中高高度 + 中高强度（植被在NIR波段反射率高）
-    - 建筑物：中高高度 + 高强度（人工表面如屋顶反射率高）
-    - 高反射物：任意高度 + 极高强度
-    - 其他：无法归类的点
-    """
-    # 强度分位数
-    p5 = float(np.percentile(norm_int, 5))
-    p10 = float(np.percentile(norm_int, 10))
-    p20 = float(np.percentile(norm_int, 20))
-    p30 = float(np.percentile(norm_int, 30))
-    p50 = float(np.percentile(norm_int, 50))
-    p70 = float(np.percentile(norm_int, 70))
-    p85 = float(np.percentile(norm_int, 85))
-    p95 = float(np.percentile(norm_int, 95))
-    
-    # 高度分位数
-    z_p5 = float(np.percentile(norm_z, 5))
-    z_p10 = float(np.percentile(norm_z, 10))
-    z_p20 = float(np.percentile(norm_z, 20))
-    z_p30 = float(np.percentile(norm_z, 30))
-    z_p40 = float(np.percentile(norm_z, 40))
-    z_p50 = float(np.percentile(norm_z, 50))
-    
-    return {
-        # 地面：低高度 + 低强度
-        'ground_int_max': p30,      # 强度低于30%分位数
-        'ground_z_max': z_p20,      # 高度低于20%分位数
-        
-        # 低矮植被：中低高度 + 中低强度
-        'low_veg_int_min': p5,
-        'low_veg_int_max': p50,
-        'low_veg_z_min': z_p5,
-        'low_veg_z_max': z_p40,
-        
-        # 树木：中高高度 + 中高强度（树木在NIR反射率高）
-        'tree_int_min': p20,
-        'tree_int_max': p85,
-        'tree_z_min': z_p20,
-        
-        # 建筑物：中高高度 + 高强度（人工表面反射率高）
-        'building_int_min': p60,
-        'building_z_min': z_p40,
-        
-        # 高反射物：任意高度 + 极高强度
-        'high_ref_int_min': p95,
-        
-        # 辅助阈值
-        'max_intensity': float(norm_int.max()),
-        'min_intensity': float(norm_int.min()),
-    }
-
-
-def _classify_by_intensity(points, intensities, output_dir, eps=1.5, min_samples=10, resolution=1.0):
-    """
-    基于反射强度的点云分类（改进版）
-
-    算法流程:
-    1. 稳健强度归一化（百分位数）
-    2. 自适应阈值计算
-    3. 多步骤分类（地面优先 → 植被 → 建筑物 → 高反射 → 其他）
-    4. 对每个类别进行 XY 平面 DBSCAN 聚类
-    5. 噪声点处理与后处理
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    n_pts = len(points)
-    if n_pts < 10:
-        raise ValueError(f"点数量不足: {n_pts}")
-
-    # ========== Step 1: 稳健强度归一化 ==========
-    norm_int, raw_p1, raw_p99 = _robust_normalize_intensities(intensities)
-
-    # ========== Step 2: 计算高度分布 ==========
-    z_vals = points[:, 2]
-    z_min_val = float(z_vals.min())
-    z_max_val = float(z_vals.max())
-    z_range = z_max_val - z_min_val
-    
-    if z_range < 1e-8:
-        norm_z = np.full(n_pts, 0.5, dtype=np.float32)
-    else:
-        norm_z = ((z_vals - z_min_val) / z_range).astype(np.float32)
-
-    # ========== Step 3: 计算自适应参数 ==========
-    xy_extent = float(max(points[:, 0].max() - points[:, 0].min(),
-                          points[:, 1].max() - points[:, 1].min()))
-    point_spacing = max(0.01, xy_extent / max(1, n_pts ** 0.5))
-    
-    # 自适应 DBSCAN 参数
-    adaptive_eps = max(0.2, point_spacing * 8)
-    adaptive_min_samples = max(3, int(1.5 / (point_spacing + 1e-6)))
-    
-    # 自适应分类阈值
-    thresholds = _compute_adaptive_thresholds(norm_int, norm_z)
-
-    # ========== Step 4: 多步骤语义分类（改进版） ==========
-    # 分类顺序策略：先检测"专属"类别，再检测"共享"类别
-    # - 地面/低矮植被：主要靠高度区分
-    # - 建筑物：靠高强度（人工表面反射率高）
-    # - 树木：靠中高强度（植被在NIR反射率较高，但通常低于建筑）
-    # - 高反射物：靠极端强度
-    semantic_labels = np.full(n_pts, "other", dtype=object)
-    assigned = np.zeros(n_pts, dtype=bool)
-
-    # --- 4a. 地面检测 ---
-    # 地面特征: 低高度 (底部20%) + 低强度
-    ground_z_mask = norm_z < thresholds['ground_z_max']
-    ground_int_mask = norm_int < thresholds['ground_int_max']
-    ground_mask = ground_z_mask & ground_int_mask & (~assigned)
-    
-    if ground_mask.sum() > 0:
-        semantic_labels[ground_mask] = "ground"
-        assigned[ground_mask] = True
-
-    # --- 4b. 低矮植被 ---
-    # 特征: 中低高度 + 中低强度
-    low_veg_z_mask = (norm_z >= thresholds['low_veg_z_min']) & (norm_z < thresholds['low_veg_z_max'])
-    low_veg_int_mask = (norm_int >= thresholds['low_veg_int_min']) & (norm_int < thresholds['low_veg_int_max'])
-    low_veg_mask = low_veg_z_mask & low_veg_int_mask & (~assigned)
-    
-    if low_veg_mask.sum() > 0:
-        semantic_labels[low_veg_mask] = "low_vegetation"
-        assigned[low_veg_mask] = True
-
-    # --- 4c. 建筑物（先于树木检测，因为建筑反射率更高）---
-    # 特征: 中高高度 + 高强度（人工表面如屋顶、墙壁反射率较高）
-    building_z_mask = norm_z >= thresholds['building_z_min']
-    building_int_mask = norm_int >= thresholds['building_int_min']
-    building_mask = building_z_mask & building_int_mask & (~assigned)
-    
-    if building_mask.sum() > 0:
-        semantic_labels[building_mask] = "building"
-        assigned[building_mask] = True
-
-    # --- 4d. 树木 ---
-    # 特征: 中高高度 + 中高强度（被排除在建筑之外的高光点）
-    # 树木在NIR波段反射率高，但通常低于人工表面
-    tree_z_mask = norm_z >= thresholds['tree_z_min']
-    tree_int_mask = (norm_int >= thresholds['tree_int_min']) & (norm_int < thresholds['tree_int_max'])
-    tree_mask = tree_z_mask & tree_int_mask & (~assigned)
-    
-    if tree_mask.sum() > 0:
-        semantic_labels[tree_mask] = "tree"
-        assigned[tree_mask] = True
-
-    # --- 4e. 高反射物 ---
-    # 特征: 任意高度 + 极高强度（金属、道路标线等）
-    high_ref_mask = (norm_int >= thresholds['high_ref_int_min']) & (~assigned)
-    
-    if high_ref_mask.sum() > 0:
-        semantic_labels[high_ref_mask] = "high_reflectivity"
-        assigned[high_ref_mask] = True
-
-    # --- 4f. 第二遍：基于高度的补充分类 ---
-    # 对仍未分类的点，根据高度进行粗略分类
-    unassigned = ~assigned
-    if unassigned.sum() > 0:
-        # 低高度未分类点 → 地面
-        low_z_unassigned = unassigned & (norm_z < thresholds['ground_z_max'])
-        if low_z_unassigned.sum() > 0:
-            semantic_labels[low_z_unassigned] = "ground"
-            assigned[low_z_unassigned] = True
-        
-        # 中高度未分类点 → 低矮植被
-        mid_z_unassigned = unassigned & (norm_z >= thresholds['low_veg_z_min']) & (norm_z < thresholds['tree_z_min'])
-        if mid_z_unassigned.sum() > 0:
-            semantic_labels[mid_z_unassigned] = "low_vegetation"
-            assigned[mid_z_unassigned] = True
-        
-        # 高高度未分类点 → 树木
-        high_z_unassigned = unassigned & (norm_z >= thresholds['tree_z_min'])
-        if high_z_unassigned.sum() > 0:
-            semantic_labels[high_z_unassigned] = "tree"
-            assigned[high_z_unassigned] = True
-
-    # --- 4g. 最终剩余点归为其他 ---
-    semantic_labels[~assigned] = "other"
-
-    # ========== Step 5: 对每个类别进行实例分割 ==========
-    instances = []
-    unique_categories = list(dict.fromkeys(semantic_labels.tolist()))
-
-    for cat_name in unique_categories:
-        cat_mask = semantic_labels == cat_name
-        cat_points = points[cat_mask]
-
-        if len(cat_points) < 3:
-            continue
-
-        cat_cfg = _CATEGORY_CONFIG.get(cat_name, _CATEGORY_CONFIG["other"])
-
-        # 地面类别：直接保存为一个大实例（不做DBSCAN分割）
-        if cat_name == "ground":
-            if len(cat_points) >= 1:
-                instances.append(_save_classify_instance(
-                    cat_points, cat_name, cat_cfg["label"], 1, output_dir))
-            continue
-
-        # 其他类别：进行DBSCAN实例分割
-        min_pts_threshold = max(3, cat_cfg.get("min_points", adaptive_min_samples))
-        
-        if len(cat_points) < min_pts_threshold:
-            # 点太少，直接保存
-            if len(cat_points) >= 1:
-                instances.append(_save_classify_instance(
-                    cat_points, cat_name, cat_cfg["label"], 1, output_dir))
-            continue
-
-        # 使用 scipy 的 cKDTree 进行高效 DBSCAN
-        try:
-            from scipy.spatial import cKDTree
-
-            xy_coords = cat_points[:, :2]
-            tree = cKDTree(xy_coords)
-            
-            eps_val = cat_cfg.get("eps", adaptive_eps)
-            if eps_val <= 0:
-                eps_val = adaptive_eps
-            
-            n_cat = len(cat_points)
-            visited = np.zeros(n_cat, dtype=bool)
-            cluster_ids = np.full(n_cat, -1, dtype=np.int32)
-            cluster_id = 0
-            min_pts = max(3, min_pts_threshold)
-
-            for i in range(n_cat):
-                if visited[i]:
-                    continue
-                neighbors = tree.query_ball_point(xy_coords[i], eps_val)
-                if len(neighbors) < min_pts:
-                    continue
-                cluster_id += 1
-                visited[i] = True
-                cluster_ids[i] = cluster_id
-                # BFS 扩展聚类
-                queue = list(neighbors)
-                while queue:
-                    j = queue.pop(0)
-                    if not visited[j]:
-                        visited[j] = True
-                        j_neighbors = tree.query_ball_point(xy_coords[j], eps_val)
-                        if len(j_neighbors) >= min_pts:
-                            for nn in j_neighbors:
-                                if nn not in queue:
-                                    queue.append(nn)
-                    if cluster_ids[j] == -1:
-                        cluster_ids[j] = cluster_id
-
-            # 提取有效聚类
-            unique_clusters = sorted({int(c) for c in cluster_ids if c >= 0})
-            cat_inst_count = 0
-            
-            for cid in unique_clusters:
-                cluster_mask = cluster_ids == cid
-                cluster_pts = cat_points[cluster_mask]
-                if len(cluster_pts) >= min_pts:
-                    cat_inst_count += 1
-                    instances.append(_save_classify_instance(
-                        cluster_pts, cat_name, cat_cfg["label"],
-                        cat_inst_count, output_dir))
-
-            # 处理噪声点：合并到最大同类实例或独立保存
-            noise_mask = cluster_ids == -1
-            if noise_mask.any():
-                noise_pts = cat_points[noise_mask]
-                
-                if len(noise_pts) >= min_pts:
-                    cat_inst_count += 1
-                    instances.append(_save_classify_instance(
-                        noise_pts, cat_name, cat_cfg["label"],
-                        cat_inst_count, output_dir))
-                elif cat_inst_count > 0:
-                    # 合并到同类最大实例
-                    existing = [(i, inst) for i, inst in enumerate(instances) if inst["category"] == cat_name]
-                    if existing:
-                        largest_idx = max(existing, key=lambda x: x[1]["count"])[0]
-                        existing_file = os.path.join(output_dir, instances[largest_idx]["file"])
-                        try:
-                            old_data = np.fromfile(existing_file, dtype=np.float32).reshape(-1, 3)
-                            merged = np.vstack([old_data, noise_pts.astype(np.float32)])
-                            merged.tofile(existing_file)
-                            instances[largest_idx]["count"] = len(merged)
-                            instances[largest_idx]["z_min"] = float(merged[:, 2].min())
-                            instances[largest_idx]["z_max"] = float(merged[:, 2].max())
-                            instances[largest_idx]["z_mean"] = float(merged[:, 2].mean())
-                        except Exception:
-                            # 合并失败则独立保存
-                            cat_inst_count += 1
-                            instances.append(_save_classify_instance(
-                                noise_pts, cat_name, cat_cfg["label"],
-                                cat_inst_count, output_dir))
-        except ImportError:
-            # scipy 不可用时，将整个类别作为一个实例
-            instances.append(_save_classify_instance(
-                cat_points, cat_name, cat_cfg["label"], 1, output_dir))
-
-    # ========== Step 6: 结果统计 ==========
-    total_classified = sum(inst["count"] for inst in instances)
-
-    category_summary = {}
-    for cat_name in list(_CATEGORY_CONFIG.keys()):
-        cat_instances = [i for i in instances if i["category"] == cat_name]
-        if cat_instances:
-            total_pts = sum(i["count"] for i in cat_instances)
-            category_summary[cat_name] = {
-                "label": _CATEGORY_CONFIG[cat_name]["label"],
-                "count": total_pts,
-                "instances": len(cat_instances),
-            }
-
-    return {
-        "total_points": int(n_pts),
-        "point_spacing": float(point_spacing),
-        "total_instances": len(instances),
-        "classified_points": int(total_classified),
-        "categories": category_summary,
-        "instances": instances,
-        "mode": "intensity",
-        "intensity_range": [float(intensities.min()), float(intensities.max())],
-        "adaptive_thresholds": thresholds,
-    }
-
-
-def _classify_hybrid(points, intensities, output_dir, eps=1.5, min_samples=10, resolution=1.0):
-    """
-    混合分类：先强度分类，再对建筑物/树木用几何特征细化
-    """
-    # Step 1: 强度分类
-    int_result = _classify_by_intensity(
-        points, intensities, output_dir, eps=eps,
-        min_samples=min_samples, resolution=resolution,
-    )
-
-    # Step 2: 对建筑物和树木实例进行几何细化
-    # （简化版：直接返回强度分类结果，后续可扩展）
-    int_result["mode"] = "hybrid"
-    return int_result
+# 注：强度分类核心函数（原「强度分类核心函数」区块，共 6 个）
+# 已于 2026-08 迁移到 backend/classify.py 模块：
+#   - classify_by_intensity  → 强度分类公开入口
+#   - classify_hybrid        → 混合分类公开入口
+#   - _run_intensity_classify_core / _intensity_save_instance /
+#     _robust_normalize_intensities / _compute_adaptive_thresholds /
+#     _INTENSITY_CATEGORY_CONFIG  → 内部实现
+# main.py 不再内联算法实现，职责收敛为路由 + 二进制协议解析 + 结果转 base64。
+# 如要调试/增强分类算法，请直接修改 classify.py 对应函数并运行 py 单测。
 
 
 # ================================================================
-# 深度学习分类接口（RandLA-Net，可选功能）
+# 深度学习分类接口（RandLA-Net，推理-only）
+# ---------------------------------------------------------------
+# 调用链：/api/classify-dl → randla_infer.infer_pipeline
+#   1) CUDA GPU 推理（分块滑动窗口 + 重叠投票）得到每点语义 logits
+#   2) idx → LAS classification 标准码（地面2/低植被3/树木5/建筑6/高反射7/其他1）
+#   3) 森林分支：classification=5 → 几何区域生长单木实例 → TreeID ExtraBytes
+#   4) 城市分支：classification=6 → 法线一致 + 欧氏聚类 → BuildingID ExtraBytes
+#   5) 写出带标签 LAS（加回坐标平移，保持原始大地坐标）
+#   6) 按 las_code / TreeID / BuildingID 展开实例 bin，兼容前端 base64 分发
+#   7) 返回 pipeline 专属字段（outputLasId 用于前端下载标记 LAS，categorySummary
+#      / instanceSummary 用于前端标签筛选面板着色与计数）
 # ================================================================
 @app.post("/api/classify-dl")
 async def classify_dl(
     request: Request,
     x_voxel_size: str = Header("0.1"),
     x_device: str = Header("auto"),
+    x_model_path: Optional[str] = Header(None),
 ):
     """
-    深度学习分类（RandLA-Net）。
-    需要 torch 模块，若未安装则返回 501 Not Implemented。
+    RandLA-Net 深度学习分类 + 实例分割管线。
+    - CUDA GPU 推理（无 CUDA 则 CPU 兜底并打印警告）
+    - 权重文件路径通过 Header X-Model-Path 传入；为空时使用随机初始化（仅用于连通性测试）
+    - 输出 LAS 保留原始大地坐标（推理时减去 min(xyz)，写 LAS 时加回）
     """
     try:
         import torch  # noqa: F401
@@ -1195,10 +915,14 @@ async def classify_dl(
             detail="深度学习分类不可用：未安装 torch 模块。请使用常规分类接口 /api/classify。",
         )
 
-    # torch 可用时，尝试调用 randla_infer
+    # 优先从环境变量读取权重路径（部署时通过 Zeabur / docker-compose env 注入），Header 覆盖
+    env_model_path = os.environ.get("RANDLA_MODEL_PATH")
+    model_path = x_model_path if x_model_path else (env_model_path or None)
+
+    # torch 可用时，调用新管线 infer_pipeline
     sys.path.insert(0, str(Path(__file__).parent))
     try:
-        from randla_infer import infer_classification
+        from randla_infer import infer_pipeline
     except ImportError:
         raise HTTPException(
             status_code=501,
@@ -1215,7 +939,8 @@ async def classify_dl(
         voxel_size = 0.1
 
     timestamp = int(time.time() * 1000)
-    dl_output_dir = OUTPUT_DIR / f"classify_dl_{timestamp}"
+    dl_folder = f"classify_dl_{timestamp}"
+    dl_output_dir = OUTPUT_DIR / dl_folder
     dl_output_dir.mkdir(parents=True, exist_ok=True)
 
     input_path = dl_output_dir / "input.bin"
@@ -1223,37 +948,101 @@ async def classify_dl(
         with open(input_path, "wb") as f:
             f.write(body)
 
-        result_info = infer_classification(
-            str(input_path),
-            str(dl_output_dir),
-            voxel_size=voxel_size,
+        # 解析输入 body：兼容 XYZ(3N) / XYZI(4N) float32
+        raw = np.frombuffer(body, dtype=np.float32)
+        if raw.size % 4 == 0 and raw.size // 4 >= 3:
+            arr = raw.reshape(-1, 4)
+            xyz_arg = arr[:, :3]
+            intensities_arg = np.clip(arr[:, 3], 0, 65535).astype(np.uint16)
+        elif raw.size % 3 == 0:
+            arr = raw.reshape(-1, 3)
+            xyz_arg = arr
+            intensities_arg = None
+        else:
+            raise HTTPException(status_code=400,
+                                detail=f"二进制长度={raw.size} 不是 3N 或 4N float32")
+
+        # 新管线：返回结构化 pipeline 元数据
+        pipe = infer_pipeline(
+            input_source=xyz_arg,          # ndarray（比写文件再读更高效）
+            output_dir=str(dl_output_dir),
+            intensities=intensities_arg,
+            model_path=model_path,
             device=x_device,
+            # voxel_size 不直接用于 RandLA-Net 前处理（新管线统一标准化），
+            # 但据此对 chunk_size 做粗略调节（点越稀疏 → 分块越小）
+            chunk_size=max(8192, int(40960 * max(0.1, voxel_size) / max(voxel_size, 0.1))),
+            overlap=2048,
+            batch_size=2048,
+            use_laz=False,
         )
 
-        # 读取每个实例文件并编码为 base64
-        instances = result_info.get("instances", [])
-        results = []
-        for inst in instances:
-            file_path = dl_output_dir / inst["file"]
-            try:
-                with open(file_path, "rb") as f:
-                    data = f.read()
-                results.append({
-                    "category": inst["category"],
-                    "categoryLabel": inst.get("category_label", inst["category"]),
-                    "instanceId": inst.get("instance_id", 1),
-                    "label": inst.get("label", inst["category"]),
-                    "count": inst.get("count", 0),
-                    "data": base64.b64encode(data).decode("ascii"),
-                })
-            except Exception as read_err:
-                print(f"读取 {inst['file']} 失败: {read_err}", file=sys.stderr)
+        # 兼容旧前端：按 las_code 类别 + TreeID 实例 + BuildingID 实例展开成 bin 文件，
+        # 再 base64 分发。这部分通过重读 output LAS 得到分类码 + 实例 ID 字段。
+        import laspy as _laspy
+        las_out = _laspy.read(pipe["output_las"])
+        N_out = len(las_out.points)
+        xyz_out = np.stack([np.asarray(las_out.x), np.asarray(las_out.y), np.asarray(las_out.z)], axis=1)
+        codes_out = np.asarray(las_out.classification).astype(np.uint8)
+        tid_out = (np.asarray(las_out["TreeID"]).astype(np.uint32)
+                   if "TreeID" in list(las_out.point_format.dimension_names)
+                   else np.zeros(N_out, dtype=np.uint32))
+        bid_out = (np.asarray(las_out["BuildingID"]).astype(np.uint32)
+                   if "BuildingID" in list(las_out.point_format.dimension_names)
+                   else np.zeros(N_out, dtype=np.uint32))
 
-        # 延迟清理
+        category_summary = pipe["category_summary"]
+        instance_summary = pipe["instance_summary"]
+        results: List[Dict[str, Any]] = []
+
+        def _append_bin(mask_local: np.ndarray, fname: str, meta: Dict[str, Any]) -> None:
+            if not mask_local.any():
+                return
+            fpath = dl_output_dir / fname
+            xyz_out[mask_local].astype(np.float32).tofile(str(fpath))
+            zs = xyz_out[mask_local, 2]
+            with open(fpath, "rb") as f:
+                data = f.read()
+            results.append({
+                "category": meta.get("key", "other"),
+                "categoryLabel": meta.get("label", meta.get("key", "other")),
+                "instanceId": int(meta.get("instanceId", 1)),
+                "label": meta.get("displayLabel", meta.get("label", "")),
+                "count": int(mask_local.sum()),
+                "data": base64.b64encode(data).decode("ascii"),
+                "lasCode": int(meta.get("lasCode", 0)),
+            })
+
+        # 1) 按类别（classification）展开"大实例"文件 → 用于前端按标签过滤整体显示
+        for code, info in category_summary.items():
+            m = codes_out == int(code)
+            _append_bin(m, f"class_{code}.bin", {
+                "key": info["key"],
+                "label": info["label"],
+                "instanceId": 1,
+                "displayLabel": info["label"],
+                "lasCode": int(code),
+            })
+
+        # 2) TreeID：每个树一个 bin
+        for tid in np.unique(tid_out[tid_out > 0]).tolist():
+            m = tid_out == int(tid)
+            meta = {"key": "tree", "label": "树木", "instanceId": int(tid),
+                    "displayLabel": f"树{int(tid)}", "lasCode": 5}
+            _append_bin(m, f"tree_{int(tid)}.bin", meta)
+
+        # 3) BuildingID：每个建筑一个 bin
+        for bid in np.unique(bid_out[bid_out > 0]).tolist():
+            m = bid_out == int(bid)
+            meta = {"key": "building", "label": "建筑物", "instanceId": int(bid),
+                    "displayLabel": f"建筑{int(bid)}", "lasCode": 6}
+            _append_bin(m, f"building_{int(bid)}.bin", meta)
+
+        # 延迟清理：从 60s 延长到 1800s（30min），给用户足够时间下载标记 LAS
         import threading
 
         def _cleanup_dir():
-            time.sleep(60)
+            time.sleep(1800)
             try:
                 shutil.rmtree(dl_output_dir, ignore_errors=True)
             except Exception:
@@ -1261,11 +1050,33 @@ async def classify_dl(
 
         threading.Thread(target=_cleanup_dir, daemon=True).start()
 
+        # 输出 LAS 的下载路径：/api/dl-outputs/{folder}/labeled_xxx.las
+        output_las_rel = str(Path(pipe["output_las"]).relative_to(OUTPUT_DIR)) \
+            if str(pipe["output_las"]).startswith(str(OUTPUT_DIR)) else os.path.basename(pipe["output_las"])
+        output_las_url = f"/api/dl-outputs/{dl_folder}/{output_las_rel}"
+        output_meta_rel = str(Path(pipe.get("output_meta", "")).relative_to(OUTPUT_DIR)) \
+            if pipe.get("output_meta") and str(pipe["output_meta"]).startswith(str(OUTPUT_DIR)) \
+            else (os.path.splitext(output_las_rel)[0] + ".json")
+        output_meta_url = f"/api/dl-outputs/{dl_folder}/{output_meta_rel}"
+
         return {
             "meta": {
-                "method": result_info.get("method", "RandLA-Net"),
-                "totalPoints": result_info.get("total_points", 0),
+                "method": "RandLA-Net",
+                "totalPoints": int(pipe["total_points"]),
                 "totalInstances": len(results),
+                "device": pipe.get("device", ""),
+                "elapsedSec": float(pipe.get("elapsed_sec", 0)),
+                "numClasses": int(pipe.get("num_classes", 0)),
+                "usedPretrained": bool(pipe.get("used_pretrained", False)),
+            },
+            # 新增：管线专属字段
+            "pipeline": {
+                "folder": dl_folder,
+                "outputLasUrl": output_las_url,
+                "outputMetaUrl": output_meta_url,
+                "shiftXyz": pipe.get("shift_xyz", [0, 0, 0]),
+                "categorySummary": category_summary,   # {code: {label, color, key, count}}
+                "instanceSummary": instance_summary,   # {trees, buildings, tree_points, building_points}
             },
             "results": results,
         }
@@ -1274,6 +1085,44 @@ async def classify_dl(
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# 下载端点：/api/dl-outputs/{folder}/{filename}
+# 用于前端"下载标记 LAS"按钮 / 直接读取标记 JSON 元数据
+@app.get("/api/dl-outputs/{folder}/{filename}")
+async def dl_download_output(folder: str, filename: str):
+    safe_folder = _sanitize_filename(folder)
+    safe_filename = _sanitize_filename(filename)
+    if safe_folder != folder or safe_filename != filename:
+        raise HTTPException(status_code=400, detail="路径包含非法字符")
+    # 必须属于 OUTPUT_DIR 下的子目录，防止绝对路径穿越
+    target = (OUTPUT_DIR / safe_folder / safe_filename).resolve()
+    try:
+        target.relative_to(OUTPUT_DIR.resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="禁止访问 OUTPUT_DIR 之外的路径")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    import aiofiles
+    from fastapi.responses import FileResponse
+
+    ext = target.suffix.lower()
+    if ext == ".json":
+        media = "application/json"
+    elif ext == ".las":
+        media = "application/octet-stream"
+    elif ext == ".laz":
+        media = "application/octet-stream"
+    elif ext == ".bin":
+        media = "application/octet-stream"
+    else:
+        media = "application/octet-stream"
+    return FileResponse(
+        path=str(target),
+        media_type=media,
+        filename=target.name,
+    )
 
 
 # ================================================================

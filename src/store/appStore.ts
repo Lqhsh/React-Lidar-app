@@ -45,6 +45,33 @@ interface Classification {
 // 预设视角类型
 export type ViewPreset = 'top' | 'front' | 'side' | 'iso'
 
+// RandLA-Net 推理管线返回的元数据契约（/api/classify-dl pipeline 字段）
+export interface DlCategorySummary {
+  lasCode: number
+  category: string
+  label: string
+  color: string
+  count: number
+  percentage: number
+}
+export interface DlInstanceSummary {
+  lasCode: number
+  category: string
+  label: string
+  count: number
+}
+export interface DlPipelineMeta {
+  pointCount: number
+  categorySummary: DlCategorySummary[]
+  instanceSummary: DlInstanceSummary[]
+  outputLasUrl: string
+  outputMetaUrl: string
+  shiftX: number
+  shiftY: number
+  shiftZ: number
+  originalBounds: { min: [number, number, number]; max: [number, number, number] }
+}
+
 // 应用全局状态接口
 interface AppState {
   theme: 'dark' | 'light'           // 主题模式
@@ -115,7 +142,12 @@ interface AppState {
   binLoadConfig: BinLoadConfig | null  // BIN 加载配置
   originalMins: [number, number, number] | null  // 原始坐标最小值
   originalMaxs: [number, number, number] | null  // 原始坐标最大值
-  
+
+  // RandLA-Net 深度学习管线元数据与交互状态
+  dlPipelineMeta: DlPipelineMeta | null
+  dlLabelFilters: Record<number, boolean>       // las_code -> 是否勾选显示（默认全部勾选）
+  dlColoringMode: 'label' | 'treeId' | 'buildingId'  // 当前着色模式
+
   // 状态操作方法
   setTheme: (theme: 'dark' | 'light') => void
   toggleSidebar: () => void
@@ -165,7 +197,12 @@ interface AppState {
   classifyDeepLearning: (voxelSize?: number, device?: string) => Promise<any[]>
   segmentTrees: (params: Record<string, number>) => Promise<any[]>
   segmentBuildings: (params: Record<string, number>) => Promise<any[]>
-  
+
+  // RandLA-Net 结果交互动作
+  setDlLabelFilter: (code: number, checked: boolean) => void
+  setDlColoringMode: (mode: 'label' | 'treeId' | 'buildingId') => void
+  clearDlPipelineMeta: () => void
+
   setMeasuring: (measuring: boolean) => void
   setMeasureTool: (tool: 'distance' | 'area' | 'height' | null) => void
   addMeasurePoint: (point: { x: number; y: number; z: number }) => void
@@ -715,7 +752,12 @@ export const useAppStore = create<AppState>((set) => ({
   binLoadConfig: null,
   originalMins: null,
   originalMaxs: null,
-  
+
+  // RandLA-Net 管线元数据 + 交互状态
+  dlPipelineMeta: null,
+  dlLabelFilters: {},
+  dlColoringMode: 'label',
+
   setShowGridAxes: (show) => set({ showGridAxes: show }),
   
   // 设置主题
@@ -815,12 +857,46 @@ export const useAppStore = create<AppState>((set) => ({
     }
   },
   
-  // 更新图层属性
-  updateLayer: (id, updates) => set((state) => ({
-    layers: state.layers.map((layer) =>
+  // 更新图层属性（同步顶层数据防护 — B1 修复）
+  // 规则：当更新的正好是当前选中图层，且 updates 中携带顶层数据字段
+  // （points / colors / intensities / radialDistances / pointCount / stats）
+  // 时，自动把相同字段同步到 store 顶层，避免"图层变了但 Viewport3D
+  // 仍在显示旧顶层数据"的双写不一致。纯 UI 属性（opacity / visible /
+  // color / name / parentFolderId 等）单独修改不会触发顶层同步。
+  updateLayer: (id, updates) => set((state) => {
+    const newLayers = state.layers.map((layer) =>
       layer.id === id ? { ...layer, ...updates } : layer
-    ),
-  })),
+    )
+    const isSelected = state.selectedLayerId === id
+    if (!isSelected) {
+      return { layers: newLayers }
+    }
+
+    // 计算从 updates 中扩散到顶层的 patch（仅数据字段，忽略 UI 字段）
+    const topPatch: Partial<AppState> = {}
+    const DATA_KEYS: (keyof Layer & keyof AppState)[] = [
+      'points', 'colors', 'intensities', 'radialDistances', 'pointCount', 'stats',
+    ]
+    for (const k of DATA_KEYS) {
+      if (k in updates && updates[k] !== undefined) {
+        ;(topPatch as any)[k] = updates[k]
+      }
+    }
+    // 若 stats 更新了，同步衍生的 boundingBox，保持与 selectLayer 的行为一致
+    if ('stats' in updates && updates.stats) {
+      const s = updates.stats
+      topPatch.boundingBox = {
+        min: [s.minX, s.minY, s.minZ] as [number, number, number],
+        max: [s.maxX, s.maxY, s.maxZ] as [number, number, number],
+      }
+    }
+
+    // 如果 patch 为空（只改了纯 UI 属性），直接返回仅更新 layers
+    if (Object.keys(topPatch).length === 0) {
+      return { layers: newLayers }
+    }
+    return { layers: newLayers, ...topPatch }
+  }),
 
   // ---------- 图层文件夹操作 ----------
   addFolder: (folder) => {
@@ -1073,7 +1149,83 @@ export const useAppStore = create<AppState>((set) => ({
   
   // 设置滤波进度
   setFilterProgress: (progress) => set({ filterProgress: progress }),
-  
+
+  // —— RandLA-Net 管线结果交互 ——
+  // 切换某个 las_code 分类的可见性：同步更新该类别下所有 RandLA 图层的 visible
+  setDlLabelFilter: (code, checked) => {
+    set((state) => {
+      const nextFilters = { ...state.dlLabelFilters, [code]: checked }
+      const updatedLayers = state.layers.map((l) => {
+        if (l.extra?.classifyMethod !== 'randla_net') return l
+        const lasCode = (l.extra as any).lasCode as number | undefined
+        if (typeof lasCode !== 'number') return l
+        const shouldShow = !!nextFilters[lasCode]
+        return shouldShow === l.visible ? l : { ...l, visible: shouldShow }
+      })
+      return { dlLabelFilters: nextFilters, layers: updatedLayers }
+    })
+  },
+
+  // 切换着色模式：'label'按类别标准色，'treeId'按TreeID哈希色（仅显示树木），'buildingId'按BuildingID哈希色（仅显示建筑）
+  setDlColoringMode: (mode) => {
+    const INSTANCE_PALETTE = [
+      '#EF4444', '#3B82F6', '#10B981', '#F59E0B', '#8B5CF6',
+      '#EC4899', '#06B6D4', '#84CC16', '#F97316', '#6366F1',
+      '#14B8A6', '#EAB308', '#A855F7', '#0EA5E9', '#22C55E',
+      '#DC2626', '#2563EB', '#059669', '#D97706', '#7C3AED',
+      '#DB2777', '#0891B2', '#65A30D', '#EA580C', '#4F46E5',
+      '#0D9488', '#CA8A04', '#9333EA', '#0284C7', '#16A34A',
+    ]
+    const colorByInstanceId = (id: number) =>
+      INSTANCE_PALETTE[(Math.abs(id >>> 0)) % INSTANCE_PALETTE.length]
+
+    set((state) => {
+      const pipeline = state.dlPipelineMeta
+      const labelColorMap: Record<number, string> = {}
+      if (pipeline) {
+        for (const c of pipeline.categorySummary) labelColorMap[c.lasCode] = c.color
+      }
+      const filters = { ...state.dlLabelFilters }
+
+      const updatedLayers = state.layers.map((l) => {
+        if (l.extra?.classifyMethod !== 'randla_net') return l
+        const extra = l.extra as any
+        const lasCode: number | undefined = extra.lasCode
+        const category: string | undefined = extra.category
+        const instanceId: number | undefined = extra.instanceId
+        if (typeof lasCode !== 'number') return l
+
+        let nextColor: string = l.color || '#888888'
+        let nextVisible: boolean = l.visible
+
+        if (mode === 'label') {
+          nextColor = labelColorMap[lasCode] || nextColor
+          nextVisible = !!filters[lasCode]
+        } else if (mode === 'treeId') {
+          const isTree = category === 'tree' || lasCode === 5
+          nextColor = isTree && typeof instanceId === 'number'
+            ? colorByInstanceId(instanceId)
+            : nextColor
+          nextVisible = isTree
+        } else if (mode === 'buildingId') {
+          const isBuilding = category === 'building' || lasCode === 6
+          nextColor = isBuilding && typeof instanceId === 'number'
+            ? colorByInstanceId(instanceId)
+            : nextColor
+          nextVisible = isBuilding
+        }
+
+        if (nextColor === l.color && nextVisible === l.visible) return l
+        return { ...l, color: nextColor, visible: nextVisible }
+      })
+
+      return { dlColoringMode: mode, layers: updatedLayers }
+    })
+  },
+
+  // 清空 RandLA-Net 管线元数据
+  clearDlPipelineMeta: () => set({ dlPipelineMeta: null, dlLabelFilters: {}, dlColoringMode: 'label' }),
+
   // 应用滤波
   applyFilter: async (method, params) => {
     set({ isFiltering: true, filterProgress: 0 })
@@ -1652,7 +1804,11 @@ export const useAppStore = create<AppState>((set) => ({
       }
 
       const data = await response.json()
-      const { results, meta } = data
+      const { results, meta, pipeline } = data as {
+        results: any[]
+        meta?: any
+        pipeline?: DlPipelineMeta | null
+      }
 
       if (!results || results.length === 0) {
         set({ isClassifying: false })
@@ -1660,24 +1816,48 @@ export const useAppStore = create<AppState>((set) => ({
         return []
       }
 
-      console.log(`[RandLA-Net] 收到结果: ${results.length} 个实例, 方法: ${meta.method}`)
+      console.log(`[RandLA-Net] 收到结果: ${results.length} 个实例, 方法: ${meta?.method}`)
 
-      // 实例调色板 - 为每个分类实例分配不同颜色
-      const instancePalette = [
-        '#EF4444', '#3B82F6', '#10B981', '#F59E0B', '#8B5CF6',
-        '#EC4899', '#06B6D4', '#84CC16', '#F97316', '#6366F1',
-        '#14B8A6', '#EAB308', '#A855F7', '#0EA5E9', '#22C55E',
-        '#DC2626', '#2563EB', '#059669', '#D97706', '#7C3AED',
-        '#DB2777', '#0891B2', '#65A30D', '#EA580C', '#4F46E5',
-        '#0D9488', '#CA8A04', '#9333EA', '#0284C7', '#16A34A',
-      ]
+      // 分类标签标准色表（若 pipeline.categorySummary 提供则以它为准，否则走 fallback）
+      const LABEL_COLOR_FALLBACK: Record<string, string> = {
+        ground: '#A16207',         // 地面 - 棕褐
+        low_vegetation: '#86EFAC', // 低矮植被 - 浅绿
+        tree: '#16A34A',           // 树木 - 深绿
+        building: '#EF4444',       // 建筑 - 红
+        high_reflectivity: '#FBBF24', // 高反射物 - 黄
+        other: '#6B7280',          // 其他 - 灰
+      }
+      const labelColorByCode: Record<number, string> = {}
+      const labelColorByCategory: Record<string, string> = { ...LABEL_COLOR_FALLBACK }
+      if (pipeline?.categorySummary) {
+        for (const c of pipeline.categorySummary) {
+          labelColorByCode[c.lasCode] = c.color
+          labelColorByCategory[c.category] = c.color
+        }
+      }
 
       const categoryLabels: Record<string, string> = {
         ground: '地面',
+        low_vegetation: '低矮植被',
         tree: '树木',
         building: '建筑物',
-        low_vegetation: '低矮植被',
+        high_reflectivity: '高反射物',
         other: '其他',
+      }
+      if (pipeline?.categorySummary) {
+        for (const c of pipeline.categorySummary) {
+          categoryLabels[c.category] = c.label
+        }
+      }
+
+      // 默认所有分类标签都勾选可见
+      const defaultFilters: Record<number, boolean> = {}
+      if (pipeline?.categorySummary) {
+        for (const c of pipeline.categorySummary) defaultFilters[c.lasCode] = true
+      }
+      // 兜底：用 results 里出现过的 lasCode
+      for (const r of results) {
+        if (typeof r.lasCode === 'number') defaultFilters[r.lasCode] ??= true
       }
 
       // 创建文件夹结构
@@ -1709,7 +1889,6 @@ export const useAppStore = create<AppState>((set) => ({
 
       const newLayers: Layer[] = []
       const classifyResults: any[] = []
-      let colorIndex = 0
 
       for (const result of results) {
         // 解码 base64 点云数据
@@ -1730,15 +1909,18 @@ export const useAppStore = create<AppState>((set) => ({
         const categoryKey: string = result.category || 'other'
         const categoryLabel: string = result.categoryLabel || categoryLabels[categoryKey] || categoryKey
         const instId: number = result.instanceId ?? 1
-        
-        // 使用实例调色板为每个实例分配不同颜色
-        const instanceColor = instancePalette[colorIndex % instancePalette.length]
-        colorIndex++
-        
+        const lasCode: number = typeof result.lasCode === 'number' ? result.lasCode : -1
+
+        // 颜色：优先按 lasCode 从后端管线给的标准色取，否则按 category fallback
+        const labelColor =
+          (typeof lasCode === 'number' && labelColorByCode[lasCode]) ||
+          labelColorByCategory[categoryKey] ||
+          '#888888'
+
         const instanceLabel = `${categoryLabel}${instId}`
 
         const layerId = `layer-randla-${categoryKey}-${instId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
-        
+
         const newLayer: Layer = {
           id: layerId,
           name: instanceLabel,
@@ -1746,7 +1928,7 @@ export const useAppStore = create<AppState>((set) => ({
           visible: true,
           opacity: 1,
           pointCount: count,
-          color: instanceColor,
+          color: labelColor,
           points: instPoints,
           colors: null,
           intensities: null,
@@ -1763,7 +1945,8 @@ export const useAppStore = create<AppState>((set) => ({
             instanceLabel,
             originalLayerId: layer.id,
             classifyMethod: 'randla_net',
-          },
+            lasCode,
+          } as any,
         }
 
         newLayers.push(newLayer)
@@ -1780,6 +1963,7 @@ export const useAppStore = create<AppState>((set) => ({
       }
 
       // 将新分类图层加入图层列表，同时将原始图层变暗作为背景
+      // 同时写入 RandLA-Net 管线元数据 + 默认勾选所有 lasCode 标签 + 默认"按标签着色"
       set((state) => {
         const updatedLayers = state.layers.map(l => {
           if (l.id === layer.id) {
@@ -1796,6 +1980,11 @@ export const useAppStore = create<AppState>((set) => ({
           layers: [...updatedLayers, ...newLayers],
           isClassifying: false,
           fitToViewTrigger: state.fitToViewTrigger + 1,
+          dlPipelineMeta: pipeline ?? state.dlPipelineMeta,
+          dlLabelFilters: Object.keys(defaultFilters).length > 0
+            ? defaultFilters
+            : state.dlLabelFilters,
+          dlColoringMode: 'label',
         }
       })
 

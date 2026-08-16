@@ -15,10 +15,16 @@ services:
     env:
       PORT: "8080"
       HOST: "0.0.0.0"
-    # 持久化存储（存储点云处理临时文件）
+      # 显式指定输出目录，匹配下面 volume 挂载点；main.py 会读取此 env
+      OUTPUT_DIR: "/app/output"
+      # 显式指定内置示例数据目录，匹配下面 volume 挂载点；用户可通过 Zeabur 面板上传数据
+      LOCAL_DATA_DIR: "/app/本地数据"
+    # 持久化存储（存储点云处理临时文件 + 内置示例数据）
     volumes:
       - mountPath: /app/output
         size: 10Gi
+      - mountPath: /app/本地数据
+        size: 5Gi
 
   # 前端服务：React + Vite 静态文件 + Nginx 反向代理
   - name: lidar-frontend

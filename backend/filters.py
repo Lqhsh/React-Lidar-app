@@ -139,12 +139,18 @@ def csf_filter(points: np.ndarray, resolution: float = 0.5, threshold: float = 0
 
 
 def csf_filter_separate(points: np.ndarray, resolution: float = 0.5, threshold: float = 0.5, max_iter: int = 100) -> dict:
-    """CSF布料滤波：返回地面点和非地面点的索引"""
+    """CSF布料滤波：返回地面点和非地面点的索引
+
+    注意：失败时抛出 ImportError（供 FastAPI 上层捕获并返回 501/500）。
+    CLI 入口已通过 filter_points_separate() 的 try/except + sys.exit 兜底。
+    """
     try:
         import CSF
-    except ImportError:
-        print("Error: cloth-simulation-filter module not found.", file=sys.stderr)
-        sys.exit(1)
+    except ImportError as e:
+        raise ImportError(
+            "cloth-simulation-filter module not found. "
+            "Install with: pip install cloth-simulation-filter"
+        ) from e
 
     if len(points) < 2:
         return {
