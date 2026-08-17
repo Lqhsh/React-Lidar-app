@@ -38,8 +38,9 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/health')" || exit 1
 
-# 启动脚本：先尝试填充内置示例数据（非阻塞，失败不影响主服务），再启动 FastAPI
+# 启动脚本：后台运行 bootstrap 下载内置数据（非阻塞），前台启动 FastAPI
+# - 后台运行避免 400MB 数据下载期间健康检查超时导致容器被杀
 # - 环境变量 BUILTIN_DATA_RELEASE_TAG 控制从哪个 GitHub Release 拉取示例 LAS
 # - 环境变量 BUILTIN_DATA_SKIP=1 可完全跳过下载
 # - 单个 LAS 直链也可通过 BUILTIN_DATA_URL_<中文文件名> 覆盖（见 builtin_data_bootstrap.py）
-CMD ["sh", "-c", "python builtin_data_bootstrap.py ; uvicorn main:app --host 0.0.0.0 --port 8080"]
+CMD ["sh", "-c", "python builtin_data_bootstrap.py & ; uvicorn main:app --host 0.0.0.0 --port 8080"]

@@ -11,8 +11,8 @@ services:
     build:
       type: docker
     run:
-      # 先运行 bootstrap 脚本从 GitHub Release 下载内置 LAS 数据，再启动 FastAPI
-      command: sh -c "python builtin_data_bootstrap.py ; uvicorn main:app --host 0.0.0.0 --port 8080"
+      # 后台运行 bootstrap 下载内置 LAS 数据，同时前台启动 FastAPI（避免健康检查超时）
+      command: sh -c "python builtin_data_bootstrap.py & ; uvicorn main:app --host 0.0.0.0 --port 8080"
     env:
       PORT: "8080"
       HOST: "0.0.0.0"
