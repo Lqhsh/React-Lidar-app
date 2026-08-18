@@ -359,49 +359,24 @@ async def get_local_data_file(filename: str, request: Request):
         "X-File-Size": str(file_size),
     }
 
-    # 检查客户端是否支持 gzip
-    accept_encoding = request.headers.get("accept-encoding", "") or ""
-    supports_gzip = "gzip" in accept_encoding.lower()
-
-    if supports_gzip and file_size > 10240:  # 大于 10KB 时启用传输压缩
-        headers = dict(base_headers)
-        headers["Content-Encoding"] = "gzip"
-        headers["X-Original-Size"] = str(file_size)
-
-        def iterfile_gzip_safe():
-            try:
-                yield from _iter_file_chunks_gzip(file_path)
-            except Exception:
-                traceback.print_exc()
-                raise
-
+    # LAS 是二进制格式，gzip 压缩率极低（~5%）但 CPU 开销大，
+    # 在 2C 容器上反而比直接传更慢，因此关闭传输压缩。
+    def iterfile_safe():
         try:
-            return StreamingResponse(
-                iterfile_gzip_safe(),
-                media_type="application/octet-stream",
-                headers=headers,
-            )
-        except Exception as e:
-            # StreamingResponse.__init__ 基本不会抛，这里兜底一下
+            yield from _iter_file_chunks(file_path)
+        except Exception:
             traceback.print_exc()
-            raise HTTPException(status_code=500, detail=str(e))
-    else:
-        def iterfile_safe():
-            try:
-                yield from _iter_file_chunks(file_path)
-            except Exception:
-                traceback.print_exc()
-                raise
+            raise
 
-        try:
-            return StreamingResponse(
-                iterfile_safe(),
-                media_type="application/octet-stream",
-                headers=base_headers,
-            )
-        except Exception as e:
-            traceback.print_exc()
-            raise HTTPException(status_code=500, detail=str(e))
+    try:
+        return StreamingResponse(
+            iterfile_safe(),
+            media_type="application/octet-stream",
+            headers=base_headers,
+        )
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ================================================================
